@@ -235,13 +235,13 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # journal gets the collector's errors; access logs are noise here
 
-    def _send(self, code, body, ctype):
+    def _send(self, code, body, ctype, cache="no-store"):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -256,6 +256,12 @@ class Handler(BaseHTTPRequestHandler):
             snap = COLLECTOR.latest()
             self._send(200, json.dumps(snap, allow_nan=False),
                        "application/json; charset=utf-8")
+        elif path == "/favicon.svg":
+            self._send(200, FAVICON, "image/svg+xml", cache="public, max-age=86400")
+        elif path == "/favicon.ico":
+            # browsers ask for this unprompted; answer 204 rather than leaving a 404
+            # in the log for a file that is deliberately served as SVG instead
+            self._send(204, b"", "image/svg+xml", cache="public, max-age=86400")
         elif path == "/healthz":
             ok = bool(COLLECTOR.latest().get("ready"))
             self._send(200 if ok else 503,
@@ -264,10 +270,24 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}), "application/json")
 
 
+# A GPU-utilisation bar meter on the dashboard's own dark ground. Four bars rather
+# than a glyph or wordmark because a favicon is read at 16 px, where lettering turns
+# to mush and bars stay legible; the colours are the three the dashboard already uses
+# for ok / busy / hot, so the tab matches the page it opens.
+FAVICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0e1116"/>
+  <rect x="10" y="34" width="9" height="18" rx="3.5" fill="#3fb950"/>
+  <rect x="22" y="24" width="9" height="28" rx="3.5" fill="#3fb950"/>
+  <rect x="34" y="13" width="9" height="39" rx="3.5" fill="#39c5cf"/>
+  <rect x="46" y="28" width="9" height="24" rx="3.5" fill="#d29922"/>
+</svg>"""
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>llamagputop</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<link rel="apple-touch-icon" href="favicon.svg">
 <style>
 :root{
   --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --line:#2a3340;
@@ -549,6 +569,8 @@ function procTable(ps){
 
 function render(s){
   $('host').textContent = s.host || '';
+  const t = s.host ? 'llamagputop \u00b7 ' + s.host : 'llamagputop';
+  if (document.title !== t) document.title = t;
   $('pwr').textContent = n(s.power && s.power.total_w, 0) + ' W';
   $('wh').textContent = n(s.power && s.power.session_wh, 2) + ' Wh';
   $('up').textContent = dur(s.uptime_s);
