@@ -1,0 +1,28 @@
+[Unit]
+Description=llamagputop web dashboard
+Documentation=https://github.com/eniga/llamagputop
+Wants=network-online.target
+After=network-online.target
+# Ordering only, not a dependency: the dashboard is useful with no llama.cpp
+# server running at all, and must not be stopped when one goes away.
+After=llama-server.service
+RequiresMountsFor=/mnt/docker/llamagputop
+
+[Service]
+Type=exec
+User=eniga
+Group=eniga
+WorkingDirectory=/mnt/docker/llamagputop
+SyslogIdentifier=llamagputop-dash
+# without this, print() sits in a pipe buffer and the journal stays empty
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 /mnt/docker/llamagputop/dashboard.py 7778
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

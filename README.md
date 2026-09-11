@@ -61,4 +61,22 @@ To use it, just run the python script in your terminal. You can pass a port numb
 
 If you want to track your CPU power, make sure your kernel allows reading the RAPL counter. You might need to add a udev rule to grant your user access to the powercap sysfs directory.
 
+There is also a web dashboard, `dashboard.py`, which serves everything the terminal view collects over HTTP. It is not a second monitor with its own opinions about your hardware: it imports `llamagputop.py` as a module and drives the same collection seam the TUI uses, so the browser and the terminal are reading one set of numbers rather than two implementations of them. It reuses the same helpers for context text, for the reason a speed is unavailable, and for the medians and extremes, and it keeps the same contract about missing data — `None` and `0` stay distinct all the way through the JSON into the page, so a card with no readable power meter renders an em dash while a genuinely idle GPU renders 0%. It has no dependencies beyond the standard library either, so there is nothing to install.
+
+Run it with `python3 dashboard.py` and it listens on `0.0.0.0:7778`. A bare number changes the HTTP port, `--bind` changes the address, `--interval` changes how often it samples, and `--llama-port` focuses a single llama.cpp server the way the positional port does for the TUI. It serves three things: `/` is the dashboard itself, `/api/metrics` is the whole snapshot as JSON, and `/healthz` answers with whether the collector has produced a sample yet, which is what you want a proxy or a container healthcheck to poll.
+
+The page shows a card per GPU with utilisation, VRAM, power against the card's cap, temperatures from every sensor the driver exposes, both clocks, and a sparkline of recent utilisation with its session min, average and peak. The CPU and memory cards carry utilisation, frequency, load average, temperatures, RAPL power, and the full memory breakdown down to zram versus disk swap. Each llama.cpp server gets its own panel with prefill and generation speed, a last-known rate explicitly marked "last" rather than dressed up as current, time to first token, context, KV cache fill, slot occupancy, speculative decoding acceptance and draft type, and the power attributed to the cards that server is actually running on. The server's full launch configuration is there too, grouped as the TUI groups it, with API keys masked. Every panel ends with an "all fields" section listing whatever keys the collector returned that the panel above did not already show, so a metric added to `llamagputop.py` later appears in the web view on its own rather than being silently dropped, and the raw snapshot is at the bottom of the page for when you want the JSON. The browser polls once a second; nothing is pushed, so it survives a reverse proxy that buffers.
+
+To keep it running across reboots, install it as a systemd service. The unit in this repository, `llamagputop-dashboard.service`, assumes the checkout is at `/mnt/docker/llamagputop` and runs as the user `eniga` — change `WorkingDirectory`, `ExecStart`, `User` and `Group` if yours differ, and note that it must not run as root, since nothing here needs privilege.
+
+```bash
+sudo install -m 644 -o root -g root llamagputop-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llamagputop-dashboard
+systemctl status llamagputop-dashboard --no-pager
+journalctl -u llamagputop-dashboard -f
+```
+
+`After=llama-server.service` there is ordering and not a dependency, on purpose: the dashboard is useful with no llama.cpp server running at all and should not be torn down when one stops. If you put it behind a reverse proxy, give it its own subdomain rather than a subpath, because the page loads its assets from the site root. Put authentication in front of it if it will be reachable from outside your network: it exposes no way to start or stop anything and it masks API keys, but it does publish your model paths, ports, process IDs and hardware inventory to anyone who can open it.
+
 Copyright 2026 XscannedX. MIT License.
