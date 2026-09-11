@@ -67,15 +67,25 @@ Run it with `python3 dashboard.py` and it listens on `0.0.0.0:7778`. A bare numb
 
 The page shows a card per GPU with utilisation, VRAM, power against the card's cap, temperatures from every sensor the driver exposes, both clocks, and a sparkline of recent utilisation with its session min, average and peak. The CPU and memory cards carry utilisation, frequency, load average, temperatures, RAPL power, and the full memory breakdown down to zram versus disk swap. Each llama.cpp server gets its own panel with prefill and generation speed, a last-known rate explicitly marked "last" rather than dressed up as current, time to first token, context, KV cache fill, slot occupancy, speculative decoding acceptance and draft type, and the power attributed to the cards that server is actually running on. The server's full launch configuration is there too, grouped as the TUI groups it, with API keys masked. Every panel ends with an "all fields" section listing whatever keys the collector returned that the panel above did not already show, so a metric added to `llamagputop.py` later appears in the web view on its own rather than being silently dropped, and the raw snapshot is at the bottom of the page for when you want the JSON. The browser polls once a second; nothing is pushed, so it survives a reverse proxy that buffers.
 
-To keep it running across reboots, install it as a systemd service. The unit in this repository, `llamagputop-dashboard.service`, assumes the checkout is at `/mnt/docker/llamagputop` and runs as the user `eniga` — change `WorkingDirectory`, `ExecStart`, `User` and `Group` if yours differ, and note that it must not run as root, since nothing here needs privilege.
+To keep it running across reboots, install it as a systemd service. The unit in this repository, `llamagputop-dashboard.service`, carries no username and no paths: its `[Service]` section is deliberately left incomplete, and the command below appends `User=`, `Group=`, `WorkingDirectory=` and `ExecStart=` to it, filled in from the account you are logged in as and from wherever you cloned the repository. Run it from inside the checkout, as your normal user — do not put `sudo` in front of the whole block, or the appended user becomes root, which is both wrong and unnecessary since nothing here needs privilege.
 
 ```bash
-sudo install -m 644 -o root -g root llamagputop-dashboard.service /etc/systemd/system/
+cd /path/to/llamagputop
+{
+  cat llamagputop-dashboard.service
+  echo "User=$(id -un)"
+  echo "Group=$(id -gn)"
+  echo "WorkingDirectory=$PWD"
+  echo "ExecStart=$(command -v python3) $PWD/dashboard.py 7778"
+} | sudo tee /etc/systemd/system/llamagputop-dashboard.service >/dev/null
+
 sudo systemctl daemon-reload
 sudo systemctl enable --now llamagputop-dashboard
 systemctl status llamagputop-dashboard --no-pager
 journalctl -u llamagputop-dashboard -f
 ```
+
+Change the trailing `7778` if you want a different port. If your checkout lives on a separate mount, add a `RequiresMountsFor=` line to the `[Unit]` section so systemd waits for it.
 
 `After=llama-server.service` there is ordering and not a dependency, on purpose: the dashboard is useful with no llama.cpp server running at all and should not be torn down when one stops. If you put it behind a reverse proxy, give it its own subdomain rather than a subpath, because the page loads its assets from the site root. Put authentication in front of it if it will be reachable from outside your network: it exposes no way to start or stop anything and it masks API keys, but it does publish your model paths, ports, process IDs and hardware inventory to anyone who can open it.
 

@@ -1,28 +1,30 @@
 [Unit]
 Description=llamagputop web dashboard
-Documentation=https://github.com/eniga/llamagputop
+Documentation=https://github.com/XscannedX/llamagputop
 Wants=network-online.target
 After=network-online.target
-# Ordering only, not a dependency: the dashboard is useful with no llama.cpp
-# server running at all, and must not be stopped when one goes away.
+# Ordering only, never a dependency: the dashboard is useful with no llama.cpp
+# server running at all and must not be torn down when one stops. Harmless on a
+# machine that has no unit by this name.
 After=llama-server.service
-RequiresMountsFor=/mnt/docker/llamagputop
 
+[Install]
+WantedBy=multi-user.target
+
+# [Service] is deliberately last and deliberately incomplete. The install command
+# in the README appends User=, Group=, WorkingDirectory= and ExecStart= to this
+# section, filled in from whoever is installing it and from wherever the checkout
+# actually lives, so nothing in this file is tied to one account or one path.
+# systemd does not care in what order the sections appear.
 [Service]
 Type=exec
-User=eniga
-Group=eniga
-WorkingDirectory=/mnt/docker/llamagputop
 SyslogIdentifier=llamagputop-dash
 # without this, print() sits in a pipe buffer and the journal stays empty
 Environment="PYTHONUNBUFFERED=1"
-ExecStart=/usr/bin/python3 /mnt/docker/llamagputop/dashboard.py 7778
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+# nothing here needs privilege; run it as an ordinary user
 NoNewPrivileges=true
 PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target

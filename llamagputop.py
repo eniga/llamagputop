@@ -1323,6 +1323,63 @@ def _parse_cmdline_flags(cmd):
     return out
 
 
+_API_KEY_CACHE = {}
+_API_KEY_TTL = 30.0
+
+
+def _cmd_for_port(port):
+    """The argv of the llama-server listening on `port`, or None."""
+    for p in glob.glob("/proc/[0-9]*"):
+        if (read(f"{p}/comm", "") or "") != "llama-server":
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if cmd and _port_of(cmd) == str(port):
+            return cmd
+    return None
+
+
+def api_key_for(port):
+    """The API key a local llama-server was started with, so the probe can authenticate.
+
+    A server started with --api-key answers 401 to /metrics, /slots and /props, and an
+    unauthenticated probe cannot tell "unauthorized" from "endpoint disabled": a
+    key-protected server therefore read as one started without --metrics, its panel
+    showed dashes with the wrong reason beside them, and every poll wrote a warning to
+    that server's own log (measured on :8080, ~15 lines a second with the web dashboard
+    running).
+
+    The key is already on the server's command line, which this program reads anyway to
+    build the config panel and masks before display, so the same source authenticates
+    the probe. Nothing new is exposed: /proc/<pid>/cmdline is readable here only because
+    the server runs as this user, and the key never reaches the screen unmasked.
+
+    Cached per port with a short TTL so a server restarted under a different key is
+    picked up without a scan of /proc on every request. LLAMAGPUTOP_API_KEY overrides,
+    for a server whose command line cannot be read (another user's process) or one
+    reached over the network.
+    """
+    env = os.environ.get("LLAMAGPUTOP_API_KEY")
+    if env:
+        return env
+    port = str(port)
+    hit = _API_KEY_CACHE.get(port)
+    if hit and time.monotonic() - hit[1] < _API_KEY_TTL:
+        return hit[0]
+    key = None
+    cmd = _cmd_for_port(port)
+    if cmd:
+        for flag, val in _parse_cmdline_flags(cmd):
+            if flag == "--api-key" and isinstance(val, str):
+                key = val
+                break
+            if flag == "--api-key-file" and isinstance(val, str):
+                lines = (read(val, "") or "").strip().splitlines()
+                key = lines[0].strip() if lines else None
+                break
+    _API_KEY_CACHE[port] = (key, time.monotonic())
+    return key
+
+
 def llama_settings_from_cmdline(port=None):
     """The active server configuration, read from its command line and organized by theme.
     EVERY flag it was launched with appears: the themed groups above give the known ones a
@@ -1525,8 +1582,15 @@ class LlamaProbe:
     def _get(self, path, timeout=2.5):
         import urllib.request
         import urllib.error
+        req = urllib.request.Request(f"http://{self.host}:{self.port}{path}")
+        # a server behind --api-key answers 401 to every endpoint this class reads;
+        # without the header the probe cannot tell that apart from the endpoint
+        # being switched off, and says the wrong thing about a working server
+        key = api_key_for(self.port)
+        if key:
+            req.add_header("Authorization", f"Bearer {key}")
         try:
-            with urllib.request.urlopen(f"http://{self.host}:{self.port}{path}", timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read().decode()
         except urllib.error.HTTPError as e:
             return e.read().decode()
