@@ -19,7 +19,9 @@ No dependencies beyond the Python standard library.
 
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -84,6 +86,140 @@ def _pct(used, total):
     return 100.0 * used / total
 
 
+# ------------------------------------------------------------------ pcie / bandwidth
+def _pcie_band(gts, width):
+    """GB/s for a link, using the same encoding-efficiency table the TUI uses, so the
+    two surfaces cannot disagree about what a given link is worth."""
+    if not gts or not width:
+        return None
+    eff = L._PCIE_EFF.get(gts, 128 / 130)
+    return gts * width * eff / 8
+
+
+def pcie_for(pci_addr):
+    """Current and maximum PCIe link for one card, plus the chain's narrowest hop.
+
+    Read from sysfs rather than from nvidia-smi so it works for every vendor, and
+    reported as current AND max because the two differ for two quite different
+    reasons: a link drops to 2.5 GT/s x8 when the card is idle (power management,
+    it comes back under load), while a max width below the card's own x16 is
+    physical — a bifurcated slot — and will not.
+    """
+    if not pci_addr:
+        return {}
+    path = f"/sys/bus/pci/devices/{pci_addr}"
+    if not os.path.exists(path):
+        return {}
+    real = os.path.realpath(path)
+    cur = L._pcie_link(real)
+    mx = L._pcie_link_max(real)
+    chain = L.pcie_chain(path)
+    out = {}
+    if cur:
+        out["pcie_gts"], out["pcie_width"] = cur
+        out["pcie_gbs"] = _pcie_band(*cur)
+    if mx:
+        out["pcie_max_gts"], out["pcie_max_width"] = mx
+        out["pcie_max_gbs"] = _pcie_band(*mx)
+    if chain:
+        out["pcie_bottleneck"] = chain.get("bottleneck")
+        out["pcie_narrow_gbs"] = chain.get("narrow_gbs")
+        out["pcie_text"] = L.pcie_text(chain)
+    return out
+
+
+class PcieFeed(threading.Thread):
+    """Live PCIe throughput, streamed from `nvidia-smi dmon -s t`.
+
+    dmon is a long-lived stream, so this costs one process for the life of the
+    dashboard instead of a spawn per refresh; the same reason llamagputop threads
+    its own nvtop and intel_gpu_top readers. Indices are mapped to PCI addresses
+    once at startup, because dmon numbers cards in nvidia-smi's order while the
+    rest of this program enumerates DRM cards, and the two need not agree.
+
+    Absent nvidia-smi, or on a non-NVIDIA card, `available` goes False and the
+    panel says which binary is missing rather than drawing a zero.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.by_addr = {}          # "0000:01:00.0" -> (rx_MBs, tx_MBs)
+        self.stop = False
+        self.available = None
+        self.reason = None
+
+    def _index_map(self, exe):
+        """nvidia-smi index -> normalised pci address."""
+        out = {}
+        try:
+            r = subprocess.run([exe, "--query-gpu=index,pci.bus_id",
+                                "--format=csv,noheader"],
+                               capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) == 2:
+                    # nvidia-smi prints 00000000:01:00.0, sysfs 0000:01:00.0
+                    out[parts[0]] = parts[1].lower()[-12:]
+        except Exception:
+            pass
+        return out
+
+    def run(self):
+        # NB: llamagputop's own which() is a predicate returning a bool, not a path
+        # like shutil.which -- passing its result to Popen is a TypeError
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            self.available = False
+            self.reason = "needs nvidia-smi"
+            return
+        while not self.stop:
+            idx = self._index_map(exe)
+            proc = None
+            try:
+                proc = subprocess.Popen([exe, "dmon", "-s", "t"],
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+                self.available = True
+                for line in proc.stdout:
+                    if self.stop:
+                        break
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    f = line.split()
+                    if len(f) < 3:
+                        continue
+                    addr = idx.get(f[0])
+                    if not addr:
+                        continue
+                    try:
+                        # dmon prints "-" for a counter this card does not report;
+                        # that is missing, not zero, so it is skipped rather than
+                        # written as 0 MB/s
+                        self.by_addr[addr] = (float(f[1]), float(f[2]))
+                    except ValueError:
+                        continue
+            except Exception as e:
+                self.available = False
+                self.reason = f"{type(e).__name__}"
+            finally:
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            if not self.stop:
+                time.sleep(3)
+
+    def get(self, pci_addr):
+        if not pci_addr:
+            return None
+        return self.by_addr.get(pci_addr.lower()[-12:])
+
+
+PCIE = PcieFeed()
+
+
 # ------------------------------------------------------------------- snapshot
 def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
     total_w, notes = L.system_power(gpus_data, cpu)
@@ -100,6 +236,17 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         g["power_pct"] = _pct(s.get("power"), s.get("power_cap"))
         g["temp_state"] = _temp_state(s.get("temp_main"))
         g["util_state"] = _util_state(s.get("util"))
+        g.update(pcie_for(s.get("pci_addr")))
+        tr = PCIE.get(s.get("pci_addr"))
+        g["pcie_rx_mbs"] = tr[0] if tr else None
+        g["pcie_tx_mbs"] = tr[1] if tr else None
+        g["pcie_traffic_reason"] = None if tr else (PCIE.reason or "waiting for nvidia-smi dmon")
+        # Peak VRAM bandwidth is deliberately absent: it needs the memory bus width,
+        # which no driver on this box exposes (not in nvidia-smi -q, not a query
+        # field, not in sysfs). Inventing it from a lookup table of product names
+        # would be exactly the fake number this project refuses to print, so the
+        # memory side reports its clock and its controller utilisation instead.
+        g["mem_clock_mhz"] = s.get("mclk")
         g["util_series"] = series(f"gpu{i}_util")
         g["vram_series"] = series(f"gpu{i}_vram")
         g["util_stats"] = stats(f"gpu{i}_util")
@@ -413,19 +560,38 @@ function rest(obj, shown){
     !shown.includes(k) && !k.endsWith('_series') && !k.endsWith('_stats') &&
     k !== 'config' && typeof obj[k] !== 'object');
   if (!keys.length) return '';
-  return `<details><summary>all fields (${keys.length})</summary><div class="kv">` +
+  return `<details data-k="fields"><summary>all fields (${keys.length})</summary><div class="kv">` +
     keys.map(k => `<div>${E(k)}</div><div class="num">${
       obj[k] === null || obj[k] === undefined ? '—' : E(obj[k])}</div>`).join('') +
     `</div></details>`;
 }
 
-function gpuCard(g){
-  const shown = ['index','vendor','name','pci_addr','util','vram_used','vram_total',
-    'vram_pct','vram_free','temp_main','power','power_cap','power_pct','sclk','mclk',
-    'mem_util','util_state','temp_state'];
+const GPU_SHOWN = ['index','vendor','name','pci_addr','util','vram_used','vram_total',
+  'vram_pct','vram_free','temp_main','power','power_cap','power_pct','sclk','mclk',
+  'mem_util','util_state','temp_state','mem_clock_mhz',
+  'pcie_gts','pcie_width','pcie_gbs','pcie_max_gts','pcie_max_width','pcie_max_gbs',
+  'pcie_bottleneck','pcie_narrow_gbs','pcie_text','pcie_rx_mbs','pcie_tx_mbs',
+  'pcie_traffic_reason'];
+
+function link(gts, w, gbs){
+  if (gts === null || gts === undefined || !w) return '<span class="dim">—</span>';
+  return `${n(gts,1)} GT/s <span class="dim">x</span>${w} · <b>${n(gbs,1)} GB/s</b>`;
+}
+
+function gpuLive(g){
   const temps = g.temp && Object.keys(g.temp).length
     ? Object.entries(g.temp).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · ') : null;
-  return `<div class="card">
+  // traffic against what the link is currently worth, in the same unit
+  const tot = (g.pcie_rx_mbs || 0) + (g.pcie_tx_mbs || 0);
+  const cap = g.pcie_gbs ? g.pcie_gbs * 1000 : null;
+  const trafficPct = cap ? 100 * tot / cap : null;
+  const traffic = g.pcie_rx_mbs === null || g.pcie_rx_mbs === undefined
+    ? `<span class="dim">— ${E(g.pcie_traffic_reason || 'unavailable')}</span>`
+    : `rx <b>${n(g.pcie_rx_mbs)}</b> · tx <b>${n(g.pcie_tx_mbs)}</b> MB/s`;
+  // a link that is downtrained while idle is normal and comes back under load; a
+  // max width below the card's own is physical and does not
+  const narrowed = g.pcie_width && g.pcie_max_width && g.pcie_width < g.pcie_max_width;
+  return `
     <h3>GPU${g.index} · ${E(g.name || g.vendor || 'GPU')}</h3>
     <div class="sub">${E(g.vendor || '')} ${g.pci_addr ? '· ' + E(g.pci_addr) : ''}</div>
     <div class="lbl"><span>utilisation</span><b class="${g.util_state}">${pc(g.util)}</b></div>
@@ -437,23 +603,34 @@ function gpuCard(g){
     <div style="margin-top:9px">
       ${row('temperature', `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
       ${temps ? row('sensors', E(temps)) : ''}
-      ${row('memory controller', pc(g.mem_util))}
       ${row('core clock', n(g.sclk) + ' MHz')}
-      ${row('memory clock', n(g.mclk) + ' MHz')}
       ${row('VRAM free', n(g.vram_free) + ' MiB')}
+    </div>
+    <div class="lbl"><span>bandwidth</span><b></b></div>
+    <div>
+      ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs))}
+      ${row('PCIe max', link(g.pcie_max_gts, g.pcie_max_width, g.pcie_max_gbs))}
+      ${narrowed ? row('link width',
+          `<span class="warn">running x${g.pcie_width} of x${g.pcie_max_width}</span>`) : ''}
+      ${g.pcie_bottleneck
+        ? row('PCIe chain', `<span class="warn">narrowest hop ${n(g.pcie_narrow_gbs,1)} GB/s</span>`) : ''}
+      ${row('PCIe traffic', traffic)}
+      ${trafficPct !== null ? bar(trafficPct, trafficPct >= 80 ? 'warn' : '') : ''}
+      ${row('memory clock', n(g.mem_clock_mhz) + ' MHz')}
+      ${row('memory controller', pc(g.mem_util))}
+      ${row('VRAM peak', '<span class="dim">— bus width not exposed by the driver</span>')}
     </div>
     ${spark(g.util_series, 'var(--ok)', 100)}
     <div class="lbl"><span>utilisation, recent</span><b>${
-      g.util_stats ? `min ${n(g.util_stats.min)} · avg ${n(g.util_stats.avg)} · max ${n(g.util_stats.max)}` : '—'}</b></div>
-    ${rest(g, shown)}
-  </div>`;
+      g.util_stats ? `min ${n(g.util_stats.min)} · avg ${n(g.util_stats.avg)} · max ${n(g.util_stats.max)}` : '—'}</b></div>`;
 }
+function gpuExtra(g){ return rest(g, GPU_SHOWN); }
 
-function cpuCard(c){
-  const shown = ['name','ncpu','util','freq','temp','power','rapl_present',
-    'loadavg','util_state','temp_state'];
+const CPU_SHOWN = ['name','ncpu','util','freq','temp','power','rapl_present',
+  'loadavg','util_state','temp_state'];
+function cpuLive(c){
   const load = Array.isArray(c.load) ? c.load.join('  ') : (c.loadavg ?? '—');
-  return `<div class="card">
+  return `
     <h3>CPU</h3><div class="sub">${E(c.name || '')} · ${n(c.ncpu)} threads</div>
     <div class="lbl"><span>utilisation</span><b class="${c.util_state}">${pc(c.util)}</b></div>
     ${bar(c.util, c.util_state)}
@@ -464,15 +641,14 @@ function cpuCard(c){
         ? '<span class="dim">— RAPL not readable</span>' : n(c.power,1) + ' W')}
     ${c.temps && Object.keys(c.temps).length
       ? row('sensors', Object.entries(c.temps).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · ')) : ''}
-    ${spark(c.util_series, 'var(--accent)', 100)}
-    ${rest(c, shown)}
-  </div>`;
+    ${spark(c.util_series, 'var(--accent)', 100)}`;
 }
+function cpuExtra(c){ return rest(c, CPU_SHOWN); }
 
-function memCard(m){
-  const shown = ['total','free','used','used_pct','cached','buffers','committed',
-    'dirty','shmem','swap_used','swap_total','swap_pct'];
-  return `<div class="card">
+const MEM_SHOWN = ['total','free','used','used_pct','cached','buffers','committed',
+  'dirty','shmem','swap_used','swap_total','swap_pct'];
+function memLive(m){
+  return `
     <h3>Memory</h3><div class="sub">${n(m.total)} MiB total</div>
     <div class="lbl"><span>used</span><b>${n(m.used)} / ${n(m.total)} MiB · ${pc(m.used_pct)}</b></div>
     ${bar(m.used_pct, m.used_pct >= 92 ? 'crit' : m.used_pct >= 80 ? 'warn' : '')}
@@ -485,38 +661,52 @@ function memCard(m){
     ${row('dirty', n(m.dirty) + ' MiB')}
     ${row('shmem', n(m.shmem) + ' MiB')}
     ${spark(m.free_series, 'var(--ser)')}
-    <div class="lbl"><span>free MiB, recent</span><b></b></div>
-    ${rest(m, shown)}
-  </div>`;
+    <div class="lbl"><span>free MiB, recent</span><b></b></div>`;
+}
+function memExtra(m){ return rest(m, MEM_SHOWN); }
+
+function powerLive(s){
+  const p = s.power || {};
+  const notes = (p.notes || []).length
+    ? (p.notes || []).map(x => row('note', E(x))).join('') : '';
+  return `
+    <h3>Power</h3><div class="sub">whole box</div>
+    ${row('total draw', n(p.total_w, 1) + ' W')}
+    ${row('session energy', n(p.session_wh, 3) + ' Wh')}
+    ${row('session length', dur(p.session_s))}
+    ${notes}
+    ${spark(p.series, 'var(--warn)')}
+    <div class="lbl"><span>watts, recent</span><b></b></div>`;
 }
 
 function cfgBlock(cfg){
   if (!cfg) return '';
   const groups = Object.keys(cfg);
   if (!groups.length) return '';
-  return `<details><summary>server configuration</summary><div class="cfg">` +
+  return `<details data-k="config"><summary>server configuration</summary><div class="cfg">` +
     groups.map(g => `<div class="g">${E(g)}</div>` +
       (cfg[g] || []).map(p => `<div class="row"><span>${E(p[0])}</span><span class="num">${E(p[1])}</span></div>`).join('')
     ).join('') + `</div></details>`;
 }
 
-function srvCard(d){
-  const shown = ['port','pid','flavor','alive','stale','phase','model','pp','tg',
-    'pp_last','tg_last','kv','kv_pct','spec','spec_pct','ctx','ctx_total','slots',
-    'ctx_text','why_pp','why_tg','power_w','active','queued','ttft_last',
-    'spec_acc','spec_draft','spec_type','spec_nmax','cache_hit','decoded',
-    'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life'];
-  const state = !d.alive ? 'off' : d.stale ? 'busy' : (d.phase === 'generating' || d.phase === 'prefill') ? 'busy' : 'on';
+const SRV_SHOWN = ['port','pid','flavor','alive','stale','phase','model','pp','tg',
+  'pp_last','tg_last','kv','kv_pct','spec','spec_pct','ctx','ctx_total','slots',
+  'ctx_text','why_pp','why_tg','power_w','active','queued','ttft_last',
+  'spec_acc','spec_draft','spec_type','spec_nmax','cache_hit','decoded',
+  'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life'];
+
+function srvLive(d){
+  const state = !d.alive ? 'off' : d.stale ? 'busy'
+    : (d.phase === 'generating' || d.phase === 'prefill') ? 'busy' : 'on';
   const pill = !d.alive ? `<span class="pill off">offline</span>`
     : d.stale ? `<span class="pill busy">no answer</span>`
     : `<span class="pill ${state === 'busy' ? 'busy' : 'on'}">${E(d.phase || 'idle')}</span>`;
-  // a past number must not wear the present tense — mark last-known rates as such
   const sp = (live, last, dec, why) => live !== null && live !== undefined
     ? `<b>${n(live, dec)}</b>`
     : (last !== null && last !== undefined
         ? `<b class="dim">${n(last, dec)}</b> <span class="dim">(last)</span>`
         : `<span class="dim">— ${E(why)}</span>`);
-  return `<div class="card">
+  return `
     <h3>llama.cpp :${E(d.port)} ${pill}</h3>
     <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''} · ${E(d.flavor || '')}</div>
     ${row('generation t/s', sp(d.tg, d.tg_last, 1, d.why_tg))}
@@ -545,11 +735,9 @@ function srvCard(d){
           d.pp_stats && d.pp_stats.median !== null
             ? `median ${n(d.pp_stats.median)} · max ${n(d.pp_stats.max)}` : ''}</b></div>` : ''}
     ${d.kv_series && d.kv_series.length > 1
-      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}
-    ${cfgBlock(d.config)}
-    ${rest(d, shown)}
-  </div>`;
+      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
 }
+function srvExtra(d){ return cfgBlock(d.config) + rest(d, SRV_SHOWN); }
 
 function procTable(ps){
   if (!ps || !ps.length) return '<div class="empty">No llama.cpp processes detected.</div>';
@@ -567,9 +755,78 @@ function procTable(ps){
     `</table></div></div>`;
 }
 
+// --------------------------------------------------------------- persistent DOM
+// The body used to be rebuilt from one innerHTML assignment per tick, which
+// destroyed and recreated every <details> on the page: an open "server
+// configuration" or "all fields" section slammed shut on the next refresh and
+// could not be read at all. Containers are created once and kept; only leaf
+// content is repainted, and only when it actually changed. So an open section
+// stays open, a text selection inside it survives, and the raw JSON keeps its
+// scroll position — none of which needed a single line of state-restoring code,
+// because the elements are simply never thrown away.
+const CARDS = new Map();
+
+function paint(el, html){
+  if (el.__h === html) return;
+  // Keeping containers alive stops most repaints, but a panel whose numbers really
+  // are changing (a server mid-generation) still has to be redrawn, and that would
+  // close a <details> the reader had opened. So the open ones are remembered by key
+  // across the swap. Keys need only be unique inside this container.
+  const open = new Set();
+  el.querySelectorAll('details[data-k]').forEach(d => { if (d.open) open.add(d.dataset.k); });
+  el.__h = html;
+  el.innerHTML = html;
+  if (open.size){
+    el.querySelectorAll('details[data-k]').forEach(d => {
+      if (open.has(d.dataset.k)) d.open = true;
+    });
+  }
+}
+
+function skeleton(){
+  const b = $('body');
+  if (b.dataset.built) return;
+  b.innerHTML =
+    `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
+    `<h2>System</h2><div class="grid" id="g-sys"></div>` +
+    `<h2>llama.cpp servers</h2><div class="grid" id="g-srv"></div>` +
+    `<h2>Processes</h2><div id="g-proc"></div>` +
+    `<h2>Raw snapshot</h2><details><summary>show full JSON (every collected field)</summary>` +
+    `<pre id="g-raw"></pre></details>`;
+  b.dataset.built = '1';
+}
+
+function card(gridId, key){
+  let c = CARDS.get(key);
+  if (!c || !c.root.isConnected){
+    const root = document.createElement('div');
+    root.className = 'card';
+    const live = document.createElement('div');
+    const extra = document.createElement('div');
+    root.append(live, extra);
+    $(gridId).append(root);
+    c = {root, live, extra};
+    CARDS.set(key, c);
+  }
+  return c;
+}
+
+function mount(gridId, key, liveHtml, extraHtml, seen){
+  seen.add(key);
+  const c = card(gridId, key);
+  paint(c.live, liveHtml);
+  paint(c.extra, extraHtml || '');
+}
+
+function prune(seen){
+  for (const [k, c] of Array.from(CARDS)){
+    if (!seen.has(k)){ c.root.remove(); CARDS.delete(k); }
+  }
+}
+
 function render(s){
   $('host').textContent = s.host || '';
-  const t = s.host ? 'llamagputop \u00b7 ' + s.host : 'llamagputop';
+  const t = s.host ? 'llamagputop · ' + s.host : 'llamagputop';
   if (document.title !== t) document.title = t;
   $('pwr').textContent = n(s.power && s.power.total_w, 0) + ' W';
   $('wh').textContent = n(s.power && s.power.session_wh, 2) + ' Wh';
@@ -578,25 +835,28 @@ function render(s){
   $('err').innerHTML = s.error
     ? `<div class="banner">collector error: ${E(s.error)}</div>` : '';
 
-  const notes = (s.power && s.power.notes || []).length
-    ? `<div class="card"><h3>Power notes</h3>${
-        s.power.notes.map(x => `<div class="row"><span>${E(x)}</span><span></span></div>`).join('')}</div>` : '';
+  skeleton();
+  const seen = new Set();
 
-  $('body').innerHTML =
-    `<h2>GPUs</h2><div class="grid">${(s.gpus || []).map(gpuCard).join('') ||
-      '<div class="empty">No GPUs detected.</div>'}</div>` +
-    `<h2>System</h2><div class="grid">${cpuCard(s.cpu || {})}${memCard(s.mem || {})}` +
-    `<div class="card"><h3>Power</h3><div class="sub">whole box</div>
-      ${row('total draw', n(s.power && s.power.total_w, 1) + ' W')}
-      ${row('session energy', n(s.power && s.power.session_wh, 3) + ' Wh')}
-      ${row('session length', dur(s.power && s.power.session_s))}
-      ${spark(s.power && s.power.series, 'var(--warn)')}
-      <div class="lbl"><span>watts, recent</span><b></b></div></div>${notes}</div>` +
-    `<h2>llama.cpp servers</h2><div class="grid">${(s.llamas || []).map(srvCard).join('') ||
-      '<div class="empty">No llama.cpp servers found.</div>'}</div>` +
-    `<h2>Processes</h2>${procTable(s.procs)}` +
-    `<h2>Raw snapshot</h2><details><summary>show full JSON (every collected field)</summary>
-      <pre>${E(JSON.stringify(s, null, 2))}</pre></details>`;
+  (s.gpus || []).forEach(g => mount('g-gpu', 'gpu' + g.index, gpuLive(g), gpuExtra(g), seen));
+  mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
+  mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
+  mount('g-sys', 'pwr', powerLive(s), '', seen);
+  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, srvLive(d), srvExtra(d), seen));
+  prune(seen);
+
+  paint($('g-proc'), procTable(s.procs));
+
+  // textContent on the existing <pre>, so the <details> around it is never
+  // recreated and stays open across refreshes; scroll is held explicitly
+  const raw = JSON.stringify(s, null, 2);
+  const pre = $('g-raw');
+  if (pre.__t !== raw){
+    const st = pre.scrollTop;
+    pre.__t = raw;
+    pre.textContent = raw;
+    pre.scrollTop = st;
+  }
 }
 
 let fails = 0;
@@ -651,6 +911,7 @@ def main():
 
     COLLECTOR = Collector(llama_port=llama_port, interval=interval)
     COLLECTOR.start()
+    PCIE.start()
 
     srv = ThreadingHTTPServer((BIND, HTTP_PORT), Handler)
     srv.daemon_threads = True
