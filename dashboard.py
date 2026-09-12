@@ -786,10 +786,15 @@ function paint(el, html){
 function skeleton(){
   const b = $('body');
   if (b.dataset.built) return;
+  // Inference leads. The servers are what this page is opened to read, and burying
+  // them under the GPU cards meant scrolling before seeing whether anything was even
+  // generating. Only this skeleton decides the order on screen: render() mounts each
+  // card into its grid by id, so the two are independent and the render order below
+  // can stay grouped by kind.
   b.innerHTML =
+    `<h2>llama.cpp servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
     `<h2>System</h2><div class="grid" id="g-sys"></div>` +
-    `<h2>llama.cpp servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>Processes</h2><div id="g-proc"></div>` +
     `<h2>Raw snapshot</h2><details><summary>show full JSON (every collected field)</summary>` +
     `<pre id="g-raw"></pre></details>`;
