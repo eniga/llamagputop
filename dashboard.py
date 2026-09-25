@@ -17,6 +17,7 @@ Usage:  python3 dashboard.py [PORT] [--bind ADDR] [--llama-port N] [--interval S
 No dependencies beyond the Python standard library.
 """
 
+import glob
 import json
 import os
 import shutil
@@ -129,16 +130,24 @@ def pcie_for(pci_addr):
 
 
 class PcieFeed(threading.Thread):
-    """Live PCIe throughput, streamed from `nvidia-smi dmon -s t`.
+    """Live PCIe throughput, read from whichever vendor tool matches the hardware.
 
-    dmon is a long-lived stream, so this costs one process for the life of the
-    dashboard instead of a spawn per refresh; the same reason llamagputop threads
-    its own nvtop and intel_gpu_top readers. Indices are mapped to PCI addresses
-    once at startup, because dmon numbers cards in nvidia-smi's order while the
-    rest of this program enumerates DRM cards, and the two need not agree.
+    The vendor is detected from the PCI vendor id of the discovered DRM cards, so
+    an AMD box asks for amd-smi and never for nvidia-smi, and vice versa. Each
+    vendor maps to its own command, the one that actually owns its counters:
 
-    Absent nvidia-smi, or on a non-NVIDIA card, `available` goes False and the
-    panel says which binary is missing rather than drawing a zero.
+        NVIDIA -> `nvidia-smi dmon -s t`      (rx/tx in MB/s)
+        AMD    -> `amd-smi metric --pcie`     (current_bandwidth_received/sent)
+        Intel  -> `intel_gpu_top`
+
+    Indices are mapped to PCI addresses once at startup, because each tool numbers
+    cards in its own order while the rest of this program enumerates DRM cards.
+
+    Two different absences stay distinct, as everywhere else in the project. A
+    missing binary earns "needs <tool>"; a present binary whose driver does not
+    publish the counter (AMD RDNA and Intel publish PCIe link speed/width but no
+    per-second rx/tx, so amd-smi answers N/A) earns an honest driver wording, never
+    a fake zero.
     """
 
     def __init__(self):
@@ -147,8 +156,36 @@ class PcieFeed(threading.Thread):
         self.stop = False
         self.available = None
         self.reason = None
+        self.vendor = None
 
-    def _index_map(self, exe):
+    @staticmethod
+    def _present_vendors():
+        """Vendor names for every DRM card with a readable PCI vendor id."""
+        out = set()
+        for card in glob.glob("/sys/class/drm/card[0-9]*"):
+            if "-" in os.path.basename(card):
+                continue
+            v = L.read(f"{card}/device/vendor")
+            if v in L._VENDOR:
+                out.add(L._VENDOR[v])
+        return out
+
+    @staticmethod
+    def _num(v):
+        """Parse a reading that may be a number, ``"N/A"``, or ``None``."""
+        if v is None or isinstance(v, bool):
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str) and v.strip().upper() == "N/A":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    # -- NVIDIA ------------------------------------------------------------
+    def _nvidia_index_map(self, exe):
         """nvidia-smi index -> normalised pci address."""
         out = {}
         try:
@@ -164,16 +201,9 @@ class PcieFeed(threading.Thread):
             pass
         return out
 
-    def run(self):
-        # NB: llamagputop's own which() is a predicate returning a bool, not a path
-        # like shutil.which -- passing its result to Popen is a TypeError
-        exe = shutil.which("nvidia-smi")
-        if not exe:
-            self.available = False
-            self.reason = "needs nvidia-smi"
-            return
+    def _nvidia_run(self, exe):
         while not self.stop:
-            idx = self._index_map(exe)
+            idx = self._nvidia_index_map(exe)
             proc = None
             try:
                 proc = subprocess.Popen([exe, "dmon", "-s", "t"],
@@ -211,6 +241,88 @@ class PcieFeed(threading.Thread):
             if not self.stop:
                 time.sleep(3)
 
+    # -- AMD ---------------------------------------------------------------
+    def _amd_index_map(self, exe):
+        """amd-smi gpu index -> normalised pci address."""
+        out = {}
+        try:
+            r = subprocess.run([exe, "list", "--json"],
+                               capture_output=True, text=True, timeout=10)
+            for g in json.loads(r.stdout):
+                bdf = g.get("bdf")
+                if bdf:
+                    out[str(g.get("gpu"))] = bdf.lower()[-12:]
+        except Exception:
+            pass
+        return out
+
+    def _amd_run(self, exe):
+        while not self.stop:
+            idx = self._amd_index_map(exe)
+            got = 0
+            try:
+                r = subprocess.run([exe, "metric", "--pcie", "--json"],
+                                   capture_output=True, text=True, timeout=15)
+                self.available = True
+                for g in json.loads(r.stdout).get("gpu_data", []):
+                    pcie = g.get("pcie", {})
+                    rx = self._num(pcie.get("current_bandwidth_received"))
+                    tx = self._num(pcie.get("current_bandwidth_sent"))
+                    addr = idx.get(str(g.get("gpu")))
+                    if addr and rx is not None and tx is not None:
+                        self.by_addr[addr] = (rx, tx)
+                        got += 1
+                if got:
+                    self.reason = None
+                else:
+                    self.reason = "PCIe throughput not exposed by this driver"
+            except Exception as e:
+                self.available = False
+                self.reason = f"{type(e).__name__}"
+            if self.stop:
+                break
+            time.sleep(2)
+
+    # -- Intel -------------------------------------------------------------
+    def _intel_run(self, exe):
+        # intel_gpu_top reports engine load, frequency and power; i915/xe publish
+        # PCIe link speed/width (already shown from sysfs) but no per-second rx/tx
+        # counter. There is nothing to stream, so this stays honest rather than
+        # inventing a number. The presence of intel_gpu_top is still checked so the
+        # reason distinguishes "tool missing" from "driver does not expose it".
+        self.available = False
+        self.reason = "PCIe throughput not exposed by the Intel driver"
+
+    def run(self):
+        vendors = self._present_vendors()
+        if "NVIDIA" in vendors:
+            self.vendor = "NVIDIA"
+            exe = shutil.which("nvidia-smi")
+            if not exe:
+                self.available = False
+                self.reason = "needs nvidia-smi"
+                return
+            self._nvidia_run(exe)
+        elif "AMD" in vendors:
+            self.vendor = "AMD"
+            exe = shutil.which("amd-smi")
+            if not exe:
+                self.available = False
+                self.reason = "needs amd-smi"
+                return
+            self._amd_run(exe)
+        elif "Intel" in vendors:
+            self.vendor = "Intel"
+            exe = shutil.which("intel_gpu_top")
+            if not exe:
+                self.available = False
+                self.reason = "needs intel_gpu_top"
+                return
+            self._intel_run(exe)
+        else:
+            self.available = False
+            self.reason = "no supported GPU"
+
     def get(self, pci_addr):
         if not pci_addr:
             return None
@@ -240,7 +352,7 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         tr = PCIE.get(s.get("pci_addr"))
         g["pcie_rx_mbs"] = tr[0] if tr else None
         g["pcie_tx_mbs"] = tr[1] if tr else None
-        g["pcie_traffic_reason"] = None if tr else (PCIE.reason or "waiting for nvidia-smi dmon")
+        g["pcie_traffic_reason"] = None if tr else (PCIE.reason or "waiting for PCIe sampler")
         # Peak VRAM bandwidth is deliberately absent: it needs the memory bus width,
         # which no driver on this box exposes (not in nvidia-smi -q, not a query
         # field, not in sysfs). Inventing it from a lookup table of product names
