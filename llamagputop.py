@@ -1068,14 +1068,23 @@ def _host_of(cmd):
 
 
 def discover_llama_servers():
-    """Every running llama-server, keyed by the port it listens on, read from the
-    process list, so a server is found on ANY port and ALL of them are found when
-    several run at once, with nothing to configure."""
+    """Every running llama-server that serves a model directly, keyed by the port it
+    listens on, read from the process list, so a server is found on ANY port and ALL
+    of them are found when several run at once, with nothing to configure.
+
+    A router (--models-dir / --models-preset) is NOT returned: it is a proxy that
+    forwards to per-model children and does not answer /metrics, /slots or /props
+    the way a model server does. Its /metrics needs a ?model= query and /props
+    reports model_path=none, and --api-key makes its endpoints answer 401 when the
+    probe's key lookup is empty for a tick, spamming the router's own log. The
+    children it spawns are the real servers and are discovered on their own ports."""
     out, seen = [], set()
     for p in glob.glob("/proc/[0-9]*"):
         if (read(f"{p}/comm", "") or "") != "llama-server":
             continue
         cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if "--models-dir" in cmd or "--models-preset" in cmd:
+            continue
         port = _port_of(cmd)
         if port in seen:
             continue
@@ -1376,7 +1385,12 @@ def api_key_for(port):
                 lines = (read(val, "") or "").strip().splitlines()
                 key = lines[0].strip() if lines else None
                 break
-    _API_KEY_CACHE[port] = (key, time.monotonic())
+    # A miss is not cached: the process may simply not be up yet (a server
+    # restarting), and pinning None for the TTL would make the probe hammer it
+    # with unauthenticated 401s until the cache expired. Only a found key is
+    # worth remembering; a miss is re-checked on the next tick.
+    if key is not None:
+        _API_KEY_CACHE[port] = (key, time.monotonic())
     return key
 
 
