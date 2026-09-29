@@ -114,7 +114,7 @@ def pcie_chain(dev_path):
     for _ in range(8):
         cur = _pcie_link(p)
         if cur:
-            nodes.append((cur, _pcie_link_max(p) or cur))
+            nodes.append((cur, _pcie_link_max(p) or cur, p))
         parent = os.path.dirname(p)
         if not re.search(r"/\d{4}:[0-9a-f]{2}:", p) or parent == p:
             break
@@ -124,9 +124,15 @@ def pcie_chain(dev_path):
     band = lambda gw: gw[0] * gw[1] * _PCIE_EFF.get(gw[0], 128 / 130) / 8
     narrow = min(nodes, key=lambda n: band(n[0]))
     root = nodes[-1]
+    # Inside a VM the root is QEMU's emulated port (Red Hat 1b36), whose link speed and
+    # width are whatever QEMU chose to advertise, not the slot. Measured 2026-09-29 on two
+    # passed-through R9700s: the root ports read 16 GT/s x16, the cards' own nodes 32 GT/s
+    # x16, and the physical slots are 32 GT/s x8. Flag it so nobody reads it as the slot.
+    virtual = (read(f"{root[2]}/vendor") or "").strip() == "0x1b36"
     return {"gts": root[0][0], "width": root[0][1], "gbs": band(root[0]),
+            "max_gts": root[1][0], "max_width": root[1][1], "max_gbs": band(root[1]),
             "narrow_gbs": band(narrow[0]), "bottleneck": band(narrow[0]) < band(root[0]) * 0.9,
-            "narrow_gts": narrow[0][0], "narrow_width": narrow[0][1]}
+            "narrow_gts": narrow[0][0], "narrow_width": narrow[0][1], "virtual": virtual}
 
 
 def pcie_text(link):
@@ -135,6 +141,13 @@ def pcie_text(link):
     t = f"PCIe {link['gts']:g} GT/s x{link['width']} · {link['gbs']:.1f} GB/s"
     if link["bottleneck"]:
         t += f" (link {link['narrow_gts']:g}x{link['narrow_width']})"
+    notes = []
+    if link.get("virtual"):
+        notes.append("virtual root port")
+    if link.get("fw_width"):
+        notes.append(f"card firmware reports x{link['fw_width']}")
+    if notes:
+        t += f" ({'; '.join(notes)})"
     return t
 
 
@@ -280,10 +293,18 @@ def _amd_gpu_metrics(card):
         # in0_input swung between 806 and 1043 mV with the clocks: a voltage that does not
         # follow the clocks is not a voltage, and 47 beside an edge temperature of 50 is
         # not a coincidence. The real core voltage comes from hwmon in0_input, which this
-        # file already reads. The blob's own voltage fields at 102, 104 and 106 read
-        # 0xffff on that card, meaning unsupported.
+        # file already reads. The blob's own voltage fields sit at 104, 106 and 108
+        # (soc, gfx, mem; 96 is the u64 firmware_timestamp) and are not decoded here.
         out["vrm_temp_gfx"] = good(u16(10))
         out["vrm_temp_soc"] = good(u16(12))
+        # pcie_link_width at 74 is the width the card's own firmware sees on its upstream
+        # link. In a VM it is the only place the physical width shows: sysfs has QEMU's
+        # emulated values. Checked 2026-09-29 on an R9700 (content_rev 3) passed through on a
+        # Gen5 x8 slot: 8, where both sysfs nodes read x16. The neighbouring pcie_link_speed
+        # at 76 read 25 (2.5 GT/s) under full load on that card, so it is not used.
+        if content_rev >= 3:
+            w = u16(74)
+            out["pcie_fw_width"] = w if w in (1, 2, 4, 8, 12, 16, 32) else None
         media = u16(20)                           # media engine activity, 0 is valid
         out["media_activity"] = None if media == 0xFFFF else media
         # Throttle. Zero is a valid reading here: it means nothing is throttling, which is
@@ -371,6 +392,9 @@ class AmdGpu:
             d["temp"][label] = sane(f"{self.card}.t.{label}",
                                     read_int(f"{self.hw}/{key}_input") // 1000, 1, 130)
         d["temp_main"] = d["temp"].get(self._guide) if self._guide else None
+        # which sensor the headline figure is: junction runs ~25 °C above edge under load,
+        # and nvtop shows edge, so an unlabelled "91 °C" beside nvtop's "66 °C" reads as a bug
+        d["temp_main_label"] = self._guide
         if self.hw:
             d["power"] = sane(f"{self.card}.w",
                               read_int(f"{self.hw}/power1_average") / 1e6, 0.1, 800)
@@ -400,6 +424,9 @@ class AmdGpu:
             if d.get(_k) is not None:
                 d.setdefault("temp", {})[_lbl] = d[_k]
         d["pcie"] = pcie_chain(self.dev)
+        fw = d.get("pcie_fw_width")
+        if d["pcie"] and fw and fw < d["pcie"]["width"]:
+            d["pcie"]["fw_width"] = fw
         # Why a field is empty. On AMD the answers are of a different kind than on
         # the other two vendors, which is why the wording is not shared with them. Intel
         # and NVIDIA are usually missing a program, so their reasons name a binary

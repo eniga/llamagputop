@@ -97,7 +97,7 @@ def _pcie_band(gts, width):
     return gts * width * eff / 8
 
 
-def pcie_for(pci_addr):
+def pcie_for(pci_addr, fw_width=None):
     """Current and maximum PCIe link for one card, plus the chain's narrowest hop.
 
     Read from sysfs rather than from nvidia-smi so it works for every vendor, and
@@ -105,24 +105,28 @@ def pcie_for(pci_addr):
     reasons: a link drops to 2.5 GT/s x8 when the card is idle (power management,
     it comes back under load), while a max width below the card's own x16 is
     physical — a bifurcated slot — and will not.
+
+    Both come from the chain's root port, the same link the terminal view reports. The
+    card's own node used to be read here instead, and on an R9700 that node describes the
+    hop to the switch on the card itself: 32 GT/s x16 while the slot ran x8, and a different
+    answer from the terminal view on the same screen.
     """
     if not pci_addr:
         return {}
     path = f"/sys/bus/pci/devices/{pci_addr}"
     if not os.path.exists(path):
         return {}
-    real = os.path.realpath(path)
-    cur = L._pcie_link(real)
-    mx = L._pcie_link_max(real)
     chain = L.pcie_chain(path)
     out = {}
-    if cur:
-        out["pcie_gts"], out["pcie_width"] = cur
-        out["pcie_gbs"] = _pcie_band(*cur)
-    if mx:
-        out["pcie_max_gts"], out["pcie_max_width"] = mx
-        out["pcie_max_gbs"] = _pcie_band(*mx)
     if chain:
+        if fw_width and fw_width < chain["width"]:
+            chain["fw_width"] = fw_width
+            out["pcie_fw_width"] = fw_width
+        out["pcie_gts"], out["pcie_width"] = chain["gts"], chain["width"]
+        out["pcie_gbs"] = chain["gbs"]
+        out["pcie_max_gts"], out["pcie_max_width"] = chain["max_gts"], chain["max_width"]
+        out["pcie_max_gbs"] = chain["max_gbs"]
+        out["pcie_virtual"] = chain["virtual"]
         out["pcie_bottleneck"] = chain.get("bottleneck")
         out["pcie_narrow_gbs"] = chain.get("narrow_gbs")
         out["pcie_text"] = L.pcie_text(chain)
@@ -348,7 +352,7 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         g["power_pct"] = _pct(s.get("power"), s.get("power_cap"))
         g["temp_state"] = _temp_state(s.get("temp_main"))
         g["util_state"] = _util_state(s.get("util"))
-        g.update(pcie_for(s.get("pci_addr")))
+        g.update(pcie_for(s.get("pci_addr"), s.get("pcie_fw_width")))
         tr = PCIE.get(s.get("pci_addr"))
         g["pcie_rx_mbs"] = tr[0] if tr else None
         g["pcie_tx_mbs"] = tr[1] if tr else None
@@ -682,11 +686,11 @@ function rest(obj, shown){
 }
 
 const GPU_SHOWN = ['index','vendor','name','pci_addr','util','vram_used','vram_total',
-  'vram_pct','vram_free','temp_main','power','power_cap','power_pct','sclk','mclk',
+  'vram_pct','vram_free','temp_main','temp_main_label','power','power_cap','power_pct','sclk','mclk',
   'mem_util','util_state','temp_state','mem_clock_mhz',
   'pcie_gts','pcie_width','pcie_gbs','pcie_max_gts','pcie_max_width','pcie_max_gbs',
   'pcie_bottleneck','pcie_narrow_gbs','pcie_text','pcie_rx_mbs','pcie_tx_mbs',
-  'pcie_traffic_reason'];
+  'pcie_traffic_reason','pcie_virtual','pcie_fw_width'];
 
 function link(gts, w, gbs){
   if (gts === null || gts === undefined || !w) return '<span class="dim">—</span>';
@@ -705,7 +709,10 @@ function gpuLive(g){
     : `rx <b>${n(g.pcie_rx_mbs)}</b> · tx <b>${n(g.pcie_tx_mbs)}</b> MB/s`;
   // a link that is downtrained while idle is normal and comes back under load; a
   // max width below the card's own is physical and does not
-  const narrowed = g.pcie_width && g.pcie_max_width && g.pcie_width < g.pcie_max_width;
+  // an emulated root port's widths are QEMU's choice (x16 of x32), not a narrowed slot
+  const narrowed = !g.pcie_virtual && g.pcie_width && g.pcie_max_width
+    && g.pcie_width < g.pcie_max_width;
+  const virt = g.pcie_virtual ? ' <span class="dim">· virtual root port</span>' : '';
   return `
     <h3>GPU${g.index} · ${E(g.name || g.vendor || 'GPU')}</h3>
     <div class="sub">${E(g.vendor || '')} ${g.pci_addr ? '· ' + E(g.pci_addr) : ''}</div>
@@ -716,15 +723,18 @@ function gpuLive(g){
     <div class="lbl"><span>power</span><b>${n(g.power,1)} / ${n(g.power_cap)} W</b></div>
     ${bar(g.power_pct, g.power_pct >= 95 ? 'warn' : '')}
     <div style="margin-top:9px">
-      ${row('temperature', `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
+      ${row(g.temp_main_label ? `temperature (${g.temp_main_label})` : 'temperature',
+          `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
       ${temps ? row('sensors', E(temps)) : ''}
       ${row('core clock', n(g.sclk) + ' MHz')}
       ${row('VRAM free', n(g.vram_free) + ' MiB')}
     </div>
     <div class="lbl"><span>bandwidth</span><b></b></div>
     <div>
-      ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs))}
-      ${row('PCIe max', link(g.pcie_max_gts, g.pcie_max_width, g.pcie_max_gbs))}
+      ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs) + virt)}
+      ${row('PCIe max', link(g.pcie_max_gts, g.pcie_max_width, g.pcie_max_gbs) + virt)}
+      ${g.pcie_fw_width ? row('card link',
+          `<span class="warn">x${g.pcie_fw_width}</span> <span class="dim">· width the card's firmware reports</span>`) : ''}
       ${narrowed ? row('link width',
           `<span class="warn">running x${g.pcie_width} of x${g.pcie_max_width}</span>`) : ''}
       ${g.pcie_bottleneck

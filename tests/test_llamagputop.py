@@ -1007,5 +1007,90 @@ class UnreadableProcessReason(Base):
         self.assertIn("non-dumpable", self.why(uid=os.geteuid()))
 
 
+class PcieChainInAVm(Base):
+    """Inside a VM the chain's root is QEMU's port and its link is invented by QEMU.
+
+    Measured 2026-09-29 on two passed-through R9700s: the card nodes read 32 GT/s x16,
+    the emulated root ports 16 GT/s x16 (max x32), the physical slots 32 GT/s x8, and
+    only the card's gpu_metrics blob carried the 8.
+    """
+
+    def tree(self, root_vendor):
+        root = os.path.join(self.root, "0000:00:1c.0")
+        card = os.path.join(root, "0000:01:00.0")
+        os.makedirs(card)
+        for path, cur, mx in ((root, ("16.0 GT/s PCIe", 16), ("16.0 GT/s PCIe", 32)),
+                              (card, ("32.0 GT/s PCIe", 16), ("32.0 GT/s PCIe", 16))):
+            self.write(os.path.join(path, "current_link_speed"), cur[0])
+            self.write(os.path.join(path, "current_link_width"), cur[1])
+            self.write(os.path.join(path, "max_link_speed"), mx[0])
+            self.write(os.path.join(path, "max_link_width"), mx[1])
+        self.write(os.path.join(root, "vendor"), root_vendor)
+        return card
+
+    def test_the_root_port_link_is_the_one_reported(self):
+        link = lgt.pcie_chain(self.tree("0x1b36"))
+        self.assertEqual((link["gts"], link["width"]), (16.0, 16))
+        self.assertEqual((link["max_gts"], link["max_width"]), (16.0, 32))
+
+    def test_a_qemu_root_port_is_flagged_virtual(self):
+        self.assertTrue(lgt.pcie_chain(self.tree("0x1b36"))["virtual"])
+
+    def test_a_real_root_port_is_not_flagged(self):
+        self.assertFalse(lgt.pcie_chain(self.tree("0x8086"))["virtual"])
+
+    def test_the_text_says_virtual_and_gives_the_firmware_width(self):
+        link = lgt.pcie_chain(self.tree("0x1b36"))
+        link["fw_width"] = 8
+        text = lgt.pcie_text(link)
+        self.assertIn("virtual root port", text)
+        self.assertIn("card firmware reports x8", text)
+
+    def test_a_plain_link_carries_no_notes(self):
+        self.assertNotIn("(", lgt.pcie_text(lgt.pcie_chain(self.tree("0x8086"))))
+
+
+class AmdFirmwareLinkWidth(Base):
+    """gpu_metrics v1_3 pcie_link_width, offset 74."""
+
+    def blob(self, content_rev, width):
+        import struct
+        d = bytearray(120)
+        struct.pack_into("<HBB", d, 0, 120, 1, content_rev)
+        struct.pack_into("<H", d, 74, width)
+        struct.pack_into("<Q", d, 112, 0)
+        card = os.path.join(self.root, f"c{content_rev}w{width}")
+        os.makedirs(os.path.join(card, "device"))
+        with open(os.path.join(card, "device", "gpu_metrics"), "wb") as f:
+            f.write(bytes(d))
+        return lgt._amd_gpu_metrics(card)
+
+    def test_the_width_is_read(self):
+        self.assertEqual(self.blob(3, 8).get("pcie_fw_width"), 8)
+
+    def test_a_zero_width_is_not_a_width(self):
+        self.assertIsNone(self.blob(3, 0).get("pcie_fw_width"))
+
+    def test_an_unsupported_marker_is_not_a_width(self):
+        self.assertIsNone(self.blob(3, 0xFFFF).get("pcie_fw_width"))
+
+    def test_older_layouts_are_not_read_at_that_offset(self):
+        self.assertNotIn("pcie_fw_width", self.blob(1, 8))
+
+
+class AmdHeadlineSensor(Base):
+    """The headline temperature says which sensor it is."""
+
+    def test_junction_is_named_when_it_is_the_headline(self):
+        card = self.card("j", dev={}, hwmon={"temp1_label": "edge", "temp1_input": 66000,
+                                             "temp2_label": "junction", "temp2_input": 91000})
+        s = lgt.AmdGpu(card, "Fixture").sample()
+        self.assertEqual((s["temp_main"], s["temp_main_label"]), (91, "junction"))
+
+    def test_edge_is_named_when_it_is_the_only_sensor(self):
+        card = self.card("e", dev={}, hwmon={"temp1_label": "edge", "temp1_input": 66000})
+        self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["temp_main_label"], "edge")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

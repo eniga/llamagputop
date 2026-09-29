@@ -11,6 +11,18 @@ Dates are the day the work was done, read from the commit history rather than ch
 one soft edge is 1.0.0.0, where a compatibility commit sits between it and 1.0.1.0 without
 belonging to either, so its date is the repository's first day rather than a release event.
 
+## Unreleased
+
+### Fixed
+
+* The dashboard and the terminal view reported different PCIe links for the same card. The terminal view took the chain's root port and the dashboard took the card's own node, and on a Radeon AI PRO R9700 the card's node describes the hop to the switch on the card itself: 32 GT/s x16 while the slot ran x8. Both now report the root port, the link the chain's own docstring already called the only stable value.
+
+* Inside a VM that root port is QEMU's emulated one, and its link is whatever QEMU advertises: 16 GT/s x16 with a maximum of x32 on two passed-through R9700s whose physical slots are 32 GT/s x8. It is now marked as a virtual root port instead of being read as the slot, and the "running x16 of x32" warning it used to trigger is suppressed, since no slot is narrowed. The width the card's own firmware sees is read from `gpu_metrics` (`pcie_link_width`, v1_3) and shown beside it, because in a VM that is the only place the physical width appears. The neighbouring `pcie_link_speed` field is not used: it read 2.5 GT/s under full load on the same card.
+
+* The dashboard's headline temperature did not say which sensor it was. It is the junction sensor when the card has one, which runs about 25 °C above the edge sensor nvtop shows, so an unlabelled 91 °C next to nvtop's 66 °C read as a fault. The row now names the sensor.
+
+* A comment placed the `gpu_metrics` voltage fields at offsets 102 to 106. They are at 104 to 108; offset 96 is the 64-bit firmware timestamp. Nothing read them, so only the comment changes.
+
 ## Version 1.0.7.0 (2026-08-28)
 
 ### Added
