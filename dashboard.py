@@ -805,7 +805,8 @@ const SRV_SHOWN = ['port','pid','flavor','alive','stale','phase','model','pp','t
   'pp_last','tg_last','kv','kv_pct','spec','spec_pct','ctx','ctx_total','slots',
   'ctx_text','why_pp','why_tg','power_w','active','queued','ttft_last',
   'spec_acc','spec_draft','spec_type','spec_nmax','cache_hit','decoded',
-  'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life'];
+  'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life',
+  'kv_pool','preemptions','ttft_n','reuse'];
 
 function srvLive(d){
   const state = !d.alive ? 'off' : d.stale ? 'busy'
@@ -819,22 +820,26 @@ function srvLive(d){
         ? `<b class="dim">${n(last, dec)}</b> <span class="dim">(last)</span>`
         : `<span class="dim">— ${E(why)}</span>`);
   return `
-    <h3>llama.cpp :${E(d.port)} ${pill}</h3>
+    <h3>${E(d.flavor || 'llama.cpp')} :${E(d.port)} ${pill}</h3>
     <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''} · ${E(d.flavor || '')}</div>
     ${row('generation t/s', sp(d.tg, d.tg_last, 1, d.why_tg))}
     ${row('prefill t/s', sp(d.pp, d.pp_last, 0, d.why_pp))}
-    ${row('TTFT', d.ttft_last === null || d.ttft_last === undefined ? '<span class="dim">—</span>' : n(d.ttft_last,2) + ' s')}
+    ${row('TTFT', d.ttft_last === null || d.ttft_last === undefined ? '<span class="dim">—</span>'
+        : n(d.ttft_last,2) + ' s' + (d.ttft_n > 1 ? ` <span class="dim">(mean of ${n(d.ttft_n)})</span>` : ''))}
     ${row('context', `<span class="mono">${E(d.ctx_text)}</span>`)}
     <div class="lbl"><span>KV cache</span><b>${pc(d.kv_pct)}${
       d.kv_used ? ` · ${n(d.kv_used)} cells` : ''}</b></div>
     ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
-    ${row('slots', `${n(d.active)} active / ${n(d.slots)} · ${n(d.queued)} queued`)}
+    ${row(d.kv_pool ? 'sequences' : 'slots', `${n(d.active)} active / ${n(d.slots)} · ${n(d.queued)} queued`)}
+    ${d.reuse === null || d.reuse === undefined ? '' : row('prompt reuse', pc(d.reuse * 100))}
+    ${d.preemptions === null || d.preemptions === undefined ? ''
+      : row('preemptions', d.preemptions > 0 ? `<span class="warn">${n(d.preemptions)}</span>` : n(d.preemptions))}
     ${row('speculative', d.spec_pct === null || d.spec_pct === undefined
         ? '<span class="dim">—</span>'
         : `${n(d.spec_pct)}% accepted${d.spec_type ? ' · ' + E(d.spec_type) : ''}${
             d.spec_nmax ? ' · n_max ' + n(d.spec_nmax) : ''}`)}
     ${row('cache hits', n(d.cache_hit))}
-    ${row('decoded', n(d.decoded) + ' tok')}
+    ${d.decoded === null || d.decoded === undefined ? '' : row('decoded', n(d.decoded) + ' tok')}
     ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
     ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
     ${d.slots_off ? row('slots endpoint', '<span class="warn">off</span>') : ''}
@@ -852,7 +857,7 @@ function srvLive(d){
 function srvExtra(d){ return cfgBlock(d.config) + rest(d, SRV_SHOWN); }
 
 function procTable(ps){
-  if (!ps || !ps.length) return '<div class="empty">No llama.cpp processes detected.</div>';
+  if (!ps || !ps.length) return '<div class="empty">No llama.cpp or vLLM processes detected.</div>';
   return `<div class="card"><div class="wrap"><table>
     <tr><th>pid</th><th>name</th><th>model</th><th>RSS MiB</th><th>VRAM MiB</th>
         <th>GTT</th><th>GPU</th><th>source</th><th>note</th></tr>` +
@@ -904,7 +909,7 @@ function skeleton(){
   // card into its grid by id, so the two are independent and the render order below
   // can stay grouped by kind.
   b.innerHTML =
-    `<h2>llama.cpp servers</h2><div class="grid" id="g-srv"></div>` +
+    `<h2>Inference servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
     `<h2>System</h2><div class="grid" id="g-sys"></div>` +
     `<h2>Processes</h2><div id="g-proc"></div>` +

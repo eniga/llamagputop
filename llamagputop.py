@@ -12,6 +12,7 @@ It is highly portable. It discovers the hardware at runtime, so it runs on any L
 Copyright 2026 XscannedX <xscannedx@gmail.com>. MIT License.
 """
 import glob
+import json
 import math
 import os
 import re
@@ -1099,7 +1100,137 @@ def discover_llama_servers():
         flavor = "llama.cpp" if executable == "llama-server" else executable
         out.append({"pid": os.path.basename(p), "port": port,
                     "host": _host_of(cmd), "model_hint": model, "flavor": flavor})
+    for srv in discover_vllm_servers():
+        if srv["port"] not in seen:
+            seen.add(srv["port"])
+            out.append(srv)
     return sorted(out, key=lambda s: s["port"])
+
+
+# ------------------------------------------------------------ vLLM server probe
+def _is_vllm(comm, cmd):
+    """The API server of a vLLM deployment, and only that process. `vllm serve` renames
+    its process to `vllm`; the engine core and the tensor-parallel workers rename
+    themselves `VLLM::EngineCore` and `VLLM::Worker_TP0`, answer no HTTP and must not be
+    probed. The older module entry point keeps `python3` as its name, so it is matched
+    by argument instead."""
+    if comm == "vllm" and "serve" in cmd:
+        return True
+    return "vllm.entrypoints.openai.api_server" in cmd
+
+
+def vllm_from_cmd(cmd, pid="?"):
+    """Server entry for a vLLM command line: port, model, host. Split from the /proc walk
+    so a command line that no process is running can be read. vLLM's default port is
+    8000, not llama.cpp's 8080, and its model is a positional argument after `serve`
+    (or --model on the module entry point), where --served-model-name is what the API
+    reports and so what the panel should call it."""
+    flags = dict(_parse_cmdline_flags(cmd))
+    port = str(flags.get("--port") or "8000")
+    host = flags.get("--host")
+    host = "127.0.0.1" if (not isinstance(host, str) or host in ("0.0.0.0", "::")) else host
+    model = flags.get("--served-model-name") or flags.get("--model")
+    if not isinstance(model, str):
+        model = ""
+        if "serve" in cmd:
+            i = cmd.index("serve")
+            if i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
+                model = cmd[i + 1]
+    return {"pid": str(pid), "port": port, "host": host, "flavor": "vLLM", "kind": "vllm",
+            "model_hint": os.path.basename(model.rstrip("/"))}
+
+
+def discover_vllm_servers():
+    """Every vLLM API server, from the process list like llama-server.
+
+    A vLLM in a container is still in the host's process list, so it is found the same
+    way, but its port is the one INSIDE the container. That is right for host networking
+    and for the usual `-p 8000:8000`, and wrong when the host port differs, which no
+    unprivileged reader can see (it is in Docker's config, not in /proc). For that case,
+    and for a server on another machine, LLAMAGPUTOP_VLLM takes a comma list of
+    host:port entries, which are probed whether or not a process is found."""
+    out, seen = [], set()
+    for p in glob.glob("/proc/[0-9]*"):
+        comm = read(f"{p}/comm", "") or ""
+        if comm not in ("vllm", "python", "python3") and not comm.startswith("python3."):
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if not _is_vllm(comm, cmd):
+            continue
+        srv = vllm_from_cmd(cmd, os.path.basename(p))
+        if srv["port"] not in seen:
+            seen.add(srv["port"])
+            out.append(srv)
+    for ent in (os.environ.get("LLAMAGPUTOP_VLLM") or "").split(","):
+        ent = ent.strip()
+        if not ent:
+            continue
+        host, _, port = ent.rpartition(":")
+        if port.isdigit() and port not in seen:
+            seen.add(port)
+            out.append({"pid": "?", "port": port, "host": host or "127.0.0.1",
+                        "flavor": "vLLM", "kind": "vllm", "model_hint": ""})
+    return out
+
+
+def _vllm_cmd_for_port(port):
+    for p in glob.glob("/proc/[0-9]*"):
+        comm = read(f"{p}/comm", "") or ""
+        if comm not in ("vllm", "python", "python3") and not comm.startswith("python3."):
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if _is_vllm(comm, cmd) and vllm_from_cmd(cmd)["port"] == str(port):
+            return cmd
+    return None
+
+
+def vllm_spec_from_cmd(cmd):
+    """(method, head, n-max) of a vLLM server's speculative decoding, from
+    --speculative-config (JSON) or the older separate flags. A draft model is named by
+    its basename; MTP with no model is the head inside the checkpoint."""
+    flags = dict(_parse_cmdline_flags(cmd or []))
+    cfg = {}
+    raw = flags.get("--speculative-config") or flags.get("--speculative_config")
+    if isinstance(raw, str):
+        try:
+            cfg = json.loads(raw)
+        except ValueError:
+            cfg = {}
+    method = cfg.get("method")
+    model = cfg.get("model") or flags.get("--speculative-model")
+    n = cfg.get("num_speculative_tokens") or flags.get("--num-speculative-tokens")
+    if not method and not model:
+        return None, None, None
+    if not isinstance(model, str):
+        model = None
+    head = os.path.basename(model.rstrip("/")) if model else (
+        "native (in model)" if method and "mtp" in method else
+        "prompt lookup" if method in ("ngram", "ngram_gpu") else None)
+    return method or "draft", head, (str(n) if n is not None else None)
+
+
+_PROM_LINE = re.compile(r'^([A-Za-z_:][\w:]*)(?:\{(.*)\})?\s+(\S+)')
+_PROM_LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def prom_parse(text):
+    """Prometheus text exposition to {name: [(labels, value), ...]}. vLLM labels every
+    series (engine, model_name, position, ...), which the llama.cpp parser, splitting
+    on the first space, would have kept inside the name."""
+    out = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        mt = _PROM_LINE.match(line)
+        if not mt:
+            continue
+        try:
+            v = float(mt.group(3))
+        except ValueError:
+            continue
+        labels = dict(_PROM_LABEL.findall(mt.group(2) or ""))
+        out.setdefault(mt.group(1), []).append((labels, v))
+    return out
 
 
 def llama_spec_from_cmdline(port=None):
@@ -1322,6 +1453,14 @@ def _parse_cmdline_flags(cmd):
     out, i = [], 0
     while i < len(cmd):
         a = cmd[i]
+        # `--flag=value` is one token carrying both. vLLM's argparse accepts it and a
+        # compose file tends to use it; without the split `--port=8000` read as a bare
+        # switch named "port=8000" and the probe could not find the port or the key.
+        # Only for a long flag: a llama.cpp value such as `-ot blk=CPU` is its own token.
+        if a.startswith("--") and "=" in a:
+            flag, _, val = a.partition("=")
+            out.append((flag, val)); i += 1
+            continue
         if is_flag(a):
             if i + 1 < len(cmd) and not is_flag(cmd[i + 1]):
                 out.append((a, cmd[i + 1])); i += 2
@@ -1337,14 +1476,14 @@ _API_KEY_TTL = 30.0
 
 
 def _cmd_for_port(port):
-    """The argv of the llama-server listening on `port`, or None."""
+    """The argv of the llama-server or vLLM server listening on `port`, or None."""
     for p in glob.glob("/proc/[0-9]*"):
         if (read(f"{p}/comm", "") or "") != "llama-server":
             continue
         cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
         if cmd and _port_of(cmd) == str(port):
             return cmd
-    return None
+    return _vllm_cmd_for_port(port)
 
 
 def api_key_for(port):
@@ -1412,17 +1551,78 @@ def llama_settings_from_cmdline(port=None):
         if port is not None and _port_of(cmd) != str(port):
             continue
         return settings_from_cmd(cmd)
+    if port is not None:
+        cmd = _vllm_cmd_for_port(port)
+        if cmd:
+            return vllm_settings_from_cmd(cmd)
     return None
 
 
-def settings_from_cmd(cmd):
+# vLLM's flags, grouped the same way and with the same rule: this is an ordering, not a
+# filter, and anything it does not name lands in "other".
+_VLLM_FLAG_GROUPS = (
+    ("loading", (
+        ("model", ("--model",)), ("served-name", ("--served-model-name",)),
+        ("quantization", ("--quantization", "-q")), ("dtype", ("--dtype",)),
+        ("tensor-parallel", ("--tensor-parallel-size", "-tp")),
+        ("pipeline-parallel", ("--pipeline-parallel-size", "-pp")),
+        ("data-parallel", ("--data-parallel-size", "-dp")),
+        ("max-model-len", ("--max-model-len",)),
+        ("gpu-mem-util", ("--gpu-memory-utilization",)),
+        ("attention", ("--attention-backend",)),
+        ("language-only", ("--language-model-only",)),
+        ("trust-remote-code", ("--trust-remote-code",)),
+        ("compilation", ("--compilation-config", "-O")),
+        ("eager", ("--enforce-eager",)),
+    )),
+    ("cache", (
+        ("kv dtype", ("--kv-cache-dtype",)), ("kv memory", ("--kv-cache-memory",)),
+        ("prefix-caching", ("--enable-prefix-caching", "--no-enable-prefix-caching")),
+        ("mamba-cache", ("--mamba-cache-mode",)), ("block-size", ("--block-size",)),
+        ("cpu-offload", ("--cpu-offload-gb",)), ("swap", ("--swap-space",)),
+    )),
+    ("scheduling", (
+        ("max-seqs", ("--max-num-seqs",)),
+        ("batched-tokens", ("--max-num-batched-tokens",)),
+        ("chunked-prefill", ("--enable-chunked-prefill", "--no-enable-chunked-prefill")),
+        ("async", ("--async-scheduling", "--no-async-scheduling")),
+    )),
+    ("reasoning", (
+        ("parser", ("--reasoning-parser",)),
+        ("tool-parser", ("--tool-call-parser",)),
+        ("auto-tool", ("--enable-auto-tool-choice",)),
+        ("chat-template", ("--chat-template",)),
+        ("generation-config", ("--generation-config", "--override-generation-config")),
+    )),
+    ("speculative", (
+        ("config", ("--speculative-config",)),
+    )),
+    ("server", (
+        ("host", ("--host",)), ("port", ("--port",)),
+        ("api-key", ("--api-key",)),
+    )),
+)
+
+
+def vllm_settings_from_cmd(cmd):
+    """The config panel for a vLLM command line. The model is a positional argument
+    after `serve`, which the flag parser skips, so it is handed over as --model."""
+    cmd = list(cmd)
+    if "serve" in cmd:
+        i = cmd.index("serve")
+        if i + 1 < len(cmd) and not cmd[i + 1].startswith("-"):
+            cmd[i + 1:i + 2] = ["--model", cmd[i + 1]]
+    return settings_from_cmd(cmd, _VLLM_FLAG_GROUPS)
+
+
+def settings_from_cmd(cmd, groups=None):
     """The grouping itself, split out from the /proc walk so it can be exercised on a
     command line that no process is running, including flags this build has never seen."""
     pairs = _parse_cmdline_flags(cmd)
-    base = lambda v: os.path.basename(v).replace(".gguf", "") if isinstance(v, str) else v
+    base = lambda v: os.path.basename(v.rstrip("/")).replace(".gguf", "") if isinstance(v, str) else v
     used = set()                       # indices of pairs a themed entry claimed
     out = {}
-    for group, entries in _LLAMA_FLAG_GROUPS:
+    for group, entries in (groups or _LLAMA_FLAG_GROUPS):
         rows = []
         for label, aliases in entries:
             hits = [(k, (flag, val)) for k, (flag, val) in enumerate(pairs)
@@ -1499,17 +1699,26 @@ def llama_processes():
     out = []
     for p in glob.glob("/proc/[0-9]*"):
         name = read(f"{p}/comm", "") or ""
-        if not name.startswith("llama-"):
+        # vLLM is several processes: the `vllm` API server, `VLLM::EngineCore`, and one
+        # `VLLM::Worker_TPn` per GPU, and it is the workers that hold the VRAM
+        if not (name.startswith("llama-") or name == "vllm" or name.startswith("VLLM::")):
             continue
         v = {"pid": os.path.basename(p), "name": name, "rss": 0, "model": "",
              "vram": 0, "gtt": 0, "read": False, "caps": [], "error": None, "gpu_accel": False,
-             "vram_src": None}
+             "vram_src": None, "uid": None}
         status = read(f"{p}/status", "") or ""
         for r in status.splitlines():
             if r.startswith("VmRSS:"):
                 v["rss"] = int(r.split()[1]) // 1024
+            elif r.startswith("Uid:"):
+                try:
+                    v["uid"] = int(r.split()[1])
+                except (IndexError, ValueError):
+                    pass
         cmd = (read(f"{p}/cmdline", "") or "").split("\x00")
-        if "-m" in cmd:
+        if name == "vllm":
+            v["model"] = vllm_from_cmd([c for c in cmd if c])["model_hint"]
+        elif "-m" in cmd:
             try:
                 v["model"] = os.path.basename(cmd[cmd.index("-m") + 1]).replace(".gguf", "")
             except IndexError:
@@ -1948,6 +2157,210 @@ class LlamaProbe:
         return d
 
 
+class VllmProbe(LlamaProbe):
+    """Reads a vLLM server into the same sample shape LlamaProbe produces, so the panel,
+    the trends, the medians and the power attribution treat it as one more server.
+
+    Everything comes from /metrics, which vLLM always serves, plus /v1/models for the
+    served name and max_model_len. Two differences from llama.cpp decide the design, and
+    both were measured on a live server (0.27, TP=2) by scraping every 0.5 s through a
+    6000-token request:
+
+    * generation_tokens_total advances on every engine step, so unlike llama.cpp's
+      counters, which move only when a request finishes, it IS the live source: the
+      generation rate is its slope while requests are running. There is no /slots.
+    * prompt_tokens_total jumps by the whole prompt in one step when prefill completes
+      (+6031 between two scrapes), so a live prefill slope does not exist here either,
+      and the completed-request figure is used, as it is for llama.cpp on a GPU.
+
+    The completed-request rates come from vLLM's per-request histograms, which time
+    each phase exactly: prefill is computed prompt tokens (prefix-cache hits excluded,
+    since they cost nothing) over prefill seconds, decode is generated tokens after the
+    first over decode seconds, and TTFT is the mean over the requests whose first token
+    landed in the interval. Every counter is summed across `engine` labels, so a
+    data-parallel deployment reads as one server."""
+
+    _CMD_TTL = 30.0
+
+    def __init__(self, port="8000", host="127.0.0.1"):
+        super().__init__(port, host)
+        self.hc = {}                       # previous tick's counter/histogram totals
+        self._glast = None                 # generation_tokens_total last tick
+        self.pool = None                   # KV pool size in tokens (cache_config_info)
+        self._cmd = None
+        self._cmd_at = 0.0
+        self.ttft_n = None
+
+    def _blank(self):
+        d = super()._blank()
+        d.update(kv_pool=self.pool, preemptions=None, ttft_n=self.ttft_n,
+                 spec_stale=False, decoded=None, budget=0)
+        return d
+
+    def _cmdline(self):
+        if self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL:
+            self._cmd = _vllm_cmd_for_port(self.port) or []
+            self._cmd_at = time.monotonic()
+        return self._cmd
+
+    def sample(self):
+        now = time.monotonic()
+        timeout_until = getattr(self, "_timeout_until", 0)
+        if now < timeout_until:
+            s = self._blank()
+            s.update(self.state)
+            s.update(phase=f"not answering ({int(timeout_until - now) + 1}s)",
+                     stale=True, pp=None, tg=None)
+            self.state = s
+            return s
+        d = self._blank()
+        try:
+            raw = self._get("/metrics")
+        except TimeoutError:
+            return self._backoff()
+        except Exception:
+            # refused: nothing is listening. Not a stale server, an absent one.
+            self.tg = self.pp = None
+            self._busy = False
+            self.state = d
+            return d
+        self._fails = 0
+        d["alive"] = True
+        m = prom_parse(raw)
+
+        def tot(name):
+            rows = m.get(name)
+            return sum(v for _, v in rows) if rows else None
+
+        running = tot("vllm:num_requests_running")
+        if running is None:
+            # answering, but not with vLLM's counters (--disable-log-stats, or not vLLM)
+            d["metrics_off"] = True
+            self.state = d
+            return d
+        waiting = tot("vllm:num_requests_waiting")
+        d["active"] = int(running)
+        d["queued"] = int(waiting) if waiting is not None else None
+        # ---- KV: a fraction of the pool, which is sized in tokens at startup
+        kv_rows = m.get("vllm:kv_cache_usage_perc") or m.get("vllm:gpu_cache_usage_perc")
+        if kv_rows:
+            d["kv"] = sum(v for _, v in kv_rows) / len(kv_rows)
+        pool = 0
+        for labels, _v in m.get("vllm:cache_config_info") or ():
+            try:
+                pool += int(labels.get("kv_cache_size_tokens")
+                            or int(labels["num_gpu_blocks"]) * int(labels["block_size"]))
+            except (KeyError, ValueError):
+                pass
+        if pool:
+            self.pool = pool
+        d["kv_pool"] = self.pool
+        if d["kv"] is not None and self.pool:
+            d["kv_cap"] = self.pool
+            d["kv_used"] = int(round(d["kv"] * self.pool))
+        # ---- prefix cache: token-level hits over token-level lookups
+        q, h = tot("vllm:prefix_cache_queries_total"), tot("vllm:prefix_cache_hits_total")
+        d["reuse"] = (h / q) if (q and h is not None) else None
+        d["cache_hit"] = int(h) if h is not None else 0
+        d["preemptions"] = tot("vllm:num_preemptions_total")
+        # ---- speculative decoding, live counters (they advance every step)
+        drafts = tot("vllm:spec_decode_num_drafts_total")
+        dtok = tot("vllm:spec_decode_num_draft_tokens_total")
+        acc = tot("vllm:spec_decode_num_accepted_tokens_total")
+        if dtok:
+            d["spec_draft"], d["spec_acc"] = dtok, acc or 0
+            d["spec"] = (acc or 0) / dtok
+        if drafts:
+            d["tok_step"] = 1.0 + (acc or 0) / drafts
+            pos = {}
+            for labels, v in m.get("vllm:spec_decode_num_accepted_tokens_per_pos_total") or ():
+                try:
+                    i = int(labels.get("position"))
+                except (TypeError, ValueError):
+                    continue
+                pos[i] = pos.get(i, 0.0) + v
+            d["spec_pos"] = [pos[i] / drafts for i in sorted(pos)]
+        # ---- completed-request rates, from the per-request histograms
+        K = ("vllm:request_prefill_kv_computed_tokens_sum", "vllm:request_prompt_tokens_sum",
+             "vllm:request_prefill_time_seconds_sum", "vllm:request_prefill_time_seconds_count",
+             "vllm:request_generation_tokens_sum", "vllm:request_generation_tokens_count",
+             "vllm:request_decode_time_seconds_sum",
+             "vllm:time_to_first_token_seconds_sum", "vllm:time_to_first_token_seconds_count")
+        c = {k: tot(k) for k in K}
+        ptok = K[0] if c[K[0]] is not None else K[1]
+        dl = lambda k: (c[k] or 0) - (self.hc.get(k) or 0)
+        restarted = any(c[k] is not None and self.hc.get(k) is not None and c[k] < self.hc[k]
+                        for k in K)
+        if self.hc and not restarted:
+            if dl(K[3]) > 0 and dl(K[2]) > 0:
+                self.pp_last = dl(ptok) / dl(K[2])
+            if dl(K[8]) > 0:
+                self.ttft_last = dl(K[7]) / dl(K[8])
+                self.ttft_n = int(dl(K[8]))
+                self._ttft_slots = 1       # a mean, not a sum: it is a TTFT at any count
+            dec = dl(K[4]) - dl(K[5])      # the first token of each request is prefill's
+            if dl(K[5]) > 0 and dl(K[6]) > 0 and dec > 0:
+                self.tg_last = dec / dl(K[6])
+        self.hc = c
+        if c[K[2]]:
+            d["pp_life"] = (c[ptok] or 0) / c[K[2]]
+        if c[K[6]] and c[K[4]] is not None and c[K[5]] is not None:
+            d["tg_life"] = (c[K[4]] - c[K[5]]) / c[K[6]]
+        # ---- live generation rate and phase
+        gen = tot("vllm:generation_tokens_total") or 0.0
+        busy = running > 0
+        advanced = self._glast is not None and gen > self._glast
+        if busy:
+            if advanced:
+                r = self._slope(self._dhist, gen, self._dlast)
+                if r is not None:
+                    self.tg = r
+            else:
+                # prefill (or a stall): no token came out, so the trail restarts rather
+                # than dividing the next tokens by time spent prefilling
+                self._dhist.clear()
+            self._dlast = gen
+        elif self._busy:
+            if self.tg_last is None and self.tg is not None:
+                self.tg_last = self.tg
+            self._dhist.clear()
+            self.tg = None
+        else:
+            self.tg = None
+        self._glast, self._busy = gen, busy
+        self.pp = None                     # not observable live, see the docstring
+        d["phase"] = ("generating" if busy and advanced else "prefill" if busy
+                      else "queued" if (waiting or 0) > 0 else "idle")
+        d["pp"], d["tg"] = self.pp, self.tg
+        d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
+        d["ttft_last"], d["ttft_slots"], d["ttft_n"] = self.ttft_last, self._ttft_slots, self.ttft_n
+        # ---- model and context, which change only on restart
+        if not self.model or time.monotonic() - self.model_at > 15:
+            self.model_at = time.monotonic()
+            try:
+                js = json.loads(self._get("/v1/models"))
+                first = (js.get("data") or [{}])[0]
+                self.model = first.get("id") or self.model
+                if isinstance(first.get("max_model_len"), int):
+                    self.ctx = first["max_model_len"]
+            except TimeoutError:
+                return self._backoff()
+            except Exception:
+                pass
+        cmd = self._cmdline()
+        flags = dict(_parse_cmdline_flags(cmd))
+        try:
+            self.slots = int(flags.get("--max-num-seqs"))
+        except (TypeError, ValueError):
+            pass
+        d["model"], d["ctx"], d["slots"] = self.model, self.ctx, self.slots
+        d["spec_type"], d["spec_head"], d["spec_nmax"] = vllm_spec_from_cmd(cmd)
+        rp = flags.get("--reasoning-parser")
+        d["reasoning_format"] = rp if isinstance(rp, str) else None
+        self.state = d
+        return d
+
+
 def sample_llama_fleet(explicit_port=None):
     """Sample every running llama-server at once. A probe is kept per port and reused
     between ticks (so its rolling rate survives), created when a server appears and
@@ -1976,9 +2389,10 @@ def sample_llama_fleet(explicit_port=None):
     for srv in servers:
         port = srv["port"]
         active.add(port)
+        cls = VllmProbe if srv.get("kind") == "vllm" else LlamaProbe
         pr = _probes.get(port)
-        if pr is None:
-            pr = _probes[port] = LlamaProbe(port, srv["host"])
+        if pr is None or type(pr) is not cls:
+            pr = _probes[port] = cls(port, srv["host"])
         todo.append((srv, pr))
     # Probe every server at once. Read one after another, a single server that has
     # stopped answering costs every other server its own timeout: one silent server
@@ -2052,7 +2466,7 @@ def probe():
     if not fleet:
         print("\n[llama.cpp] no server found")
     for ll in fleet:
-        print(f"\n[llama.cpp :{ll['port']}] pid={ll['pid']} alive={ll['alive']} "
+        print(f"\n[{ll.get('flavor') or 'llama.cpp'} :{ll['port']}] pid={ll['pid']} alive={ll['alive']} "
               f"model={ll['model'] or '—'} phase={ll['phase']} "
               f"pp={_n(ll.get('pp'))}/last {_n(ll.get('pp_last'))} "
               f"tg={_n(ll.get('tg'), 1)}/last {_n(ll.get('tg_last'), 1)} "
@@ -2531,7 +2945,13 @@ def _llama_proc_rows(procs, width):
         seg = [(f"{p['pid']:>7} ", DIM), (f"{name:<26}", 0), (f" RSS {p['rss']}M", DIM)]
         if not p["read"]:
             if p.get("error") == "oserror":
-                if p["caps"]:
+                # Ownership first. A process running as root (a vLLM container, say)
+                # holds every capability, so the capability test below would blame
+                # "cap 0" for what is simply another user's process.
+                if p.get("uid") is not None and p["uid"] != os.geteuid():
+                    why = ("owned by root — run llamagputop with sudo" if p["uid"] == 0
+                           else "owned by another user — run llamagputop with sudo")
+                elif p["caps"]:
                     why = f"{p['caps'][0]} → non-dumpable, needs root"
                 elif os.geteuid() != 0:
                     why = "owned by another user — run llamagputop with sudo"
@@ -2771,6 +3191,13 @@ def _ctx_text(d):
     against 12288). Show both whenever they differ, so neither panel silently contradicts
     the other."""
     per, tot, sl = d.get("ctx"), d.get("ctx_total"), d.get("slots")
+    # vLLM has no per-slot split at all: every sequence draws pages from one shared pool,
+    # sized in tokens at startup, and max_model_len caps a single request. Reading them
+    # as llama.cpp's slot × context would multiply out to an allocation that does not
+    # exist (8 × 262144 against a 591218-token pool on the box this was written on).
+    if d.get("kv_pool"):
+        return (f"ctx {per or '—'}/request · pool {d['kv_pool']} tok"
+                + (f" · {sl} seqs max" if sl else ""))
     if not per:
         return f"ctx {tot}" if tot else "ctx —"
     if tot and tot != per:
@@ -2795,6 +3222,8 @@ def _why(d, which):
         return "server did not answer"
     if d.get("slots_off"):
         return "slots endpoint off"
+    if which == "pp" and d.get("flavor") == "vLLM" and not d.get("metrics_off"):
+        return "idle; vLLM reports prefill when it completes"
     if which == "pp" and d.get("metrics_off"):
         return "idle; needs --metrics for completed prefills"
     return "idle"
@@ -2852,6 +3281,11 @@ def _llama_rows(d, width):
         if _sl > 1:
             speed.append([("prefill time ", DIM), (f"{d['ttft_last']:.2f}s", 0),
                           (f" ({_sl} slots, summed)", DIM)])
+        elif (d.get("ttft_n") or 0) > 1:
+            # vLLM's histogram gives a sum AND a count, so several requests landing in
+            # one interval still yield a true TTFT: their mean, and it says how many
+            speed.append([("ttft ", DIM), (f"{d['ttft_last']:.2f}s", 0),
+                          (f" mean of {d['ttft_n']}", DIM)])
         else:
             speed.append([("ttft ", DIM), (f"{d['ttft_last']:.2f}s", 0), (" last", DIM)])
     if d.get("pp_life") or d.get("tg_life"):
@@ -2860,7 +3294,9 @@ def _llama_rows(d, width):
                       (" t/s avg", DIM)])
     elif d.get("metrics_off"):
         speed.append([("metrics off", WARN),
-                      (" — start with --metrics for reuse, queue and session averages", DIM)])
+                      (" — vLLM exports no vllm:* counters (--disable-log-stats?)"
+                       if d.get("flavor") == "vLLM" else
+                       " — start with --metrics for reuse, queue and session averages", DIM)])
     rows += _flow(speed, inner)
     # kv fill, how deep the context has ever gone, the generation budget, prompt reuse
     if d.get("kv") is not None:
@@ -2883,6 +3319,11 @@ def _llama_rows(d, width):
         if d.get("reuse") is not None:
             ri = d["reuse"]
             kv_cells.append([("prompt reuse ", DIM), (f"{ri * 100:.1f}%", OK if ri > 0.3 else 0)])
+        # vLLM evicts a running sequence when the pool runs out and recomputes it later;
+        # a count that moves means the KV pool, not the model, is setting the pace
+        if d.get("preemptions") is not None:
+            pe = int(d["preemptions"])
+            kv_cells.append([("preempted ", DIM), (f"{pe}", WARN if pe else 0)])
         rows += _flow(kv_cells, inner)
     elif d.get("reuse") is not None:
         ri = d["reuse"]
@@ -3322,8 +3763,8 @@ def main():
     if "--help" in argv or "-h" in argv:
         print("llamagputop — a terminal GPU + llama.cpp inference monitor for Linux.\n")
         print("Usage: llamagputop.py [PORT] [--once | --line | --probe]\n")
-        print("  PORT      focus one llama.cpp port; omit to auto-detect EVERY running")
-        print("            server (each gets its own panel)")
+        print("  PORT      focus one llama.cpp or vLLM port; omit to auto-detect EVERY")
+        print("            running server (each gets its own panel)")
         print("  --once    print one status line and exit    (for scripts)")
         print("  --line    print a status line every tick    (for logging)")
         print("  --probe   dump the detected hardware and exit")
@@ -3331,6 +3772,7 @@ def main():
         print("TUI keys:  q quit   ↑↓ PgUp/PgDn Home/End scroll   +/- refresh rate   z reset history")
         print("Honors NO_COLOR. No dependencies beyond the Python standard library;")
         print("optional helpers used when present: lspci, intel_gpu_top, nvtop, nvidia-smi.")
+        print("LLAMAGPUTOP_VLLM=host:port[,...] adds vLLM servers discovery cannot reach.")
         return
     port = next((a for a in argv if a.isdigit()), None)
     gpus, feeds = discover_gpus()
