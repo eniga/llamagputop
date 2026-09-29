@@ -592,6 +592,9 @@ h2:first-child{margin-top:0}
 .pill.on{color:var(--ok);border-color:rgba(63,185,80,.4)}
 .pill.off{color:var(--crit);border-color:rgba(248,81,73,.4)}
 .pill.busy{color:var(--ser);border-color:rgba(57,197,207,.4)}
+.big{font-size:22px;font-weight:650;margin-top:10px;line-height:1.1}
+.big span{font-size:12px;font-weight:400;color:var(--dim)}
+.live{color:var(--ok);border:1px solid rgba(63,185,80,.4);border-radius:20px;padding:0 6px;font-size:10.5px}
 svg.spark{display:block;width:100%;height:34px;margin-top:8px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -806,7 +809,9 @@ const SRV_SHOWN = ['port','pid','flavor','alive','stale','phase','model','pp','t
   'ctx_text','why_pp','why_tg','power_w','active','queued','ttft_last',
   'spec_acc','spec_draft','spec_type','spec_nmax','cache_hit','decoded',
   'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life',
-  'kv_pool','preemptions','ttft_n','reuse'];
+  'kv_pool','preemptions','ttft_n','reuse',
+  'run','prun','reuse_recent','ingest','ttft_avg','tpot_avg','e2e_avg','prompt_avg',
+  'answer_avg','gen_total','prompt_total','req_total'];
 
 function srvLive(d){
   const state = !d.alive ? 'off' : d.stale ? 'busy'
@@ -855,6 +860,70 @@ function srvLive(d){
       ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
 }
 function srvExtra(d){ return cfgBlock(d.config) + rest(d, SRV_SHOWN); }
+
+// ---------------------------------------------------------------- vLLM panel
+// vLLM reports whole requests, not slots, so its panel is built around runs (a stretch of
+// ticks with work in it) and the request histograms. Prefill is never live on vLLM: its
+// prompt counters move once per request, when that request's prefill completes, so the
+// prefill figures are per completed request and are labelled that way.
+const nk = v => v === null || v === undefined ? '—' : Math.round(v).toLocaleString('en-US');
+const ms = v => v === null || v === undefined ? '—' : nk(v * 1000) + ' ms';
+const ago = t => {
+  if (!t) return '';
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago`
+    : `${(s / 3600).toFixed(1)}h ago`;
+};
+const runDur = s => s === null || s === undefined ? '—' : s < 60 ? `${Math.round(s)} s`
+  : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+
+function srvVllm(d){
+  const state = !d.alive ? 'off' : d.stale ? 'busy'
+    : (d.phase === 'generating' || d.phase === 'prefill') ? 'busy' : 'on';
+  const pill = !d.alive ? `<span class="pill off">offline</span>`
+    : d.stale ? `<span class="pill busy">no answer</span>`
+    : `<span class="pill ${state === 'busy' ? 'busy' : 'on'}">${E(d.phase || 'idle')}</span>`;
+  const r = d.run, p = d.prun, rr = d.reuse_recent;
+  const liveTag = x => x && x.live ? ' <span class="live">live</span>'
+    : x && x.ended ? ` <span class="dim">· ${ago(x.ended)}</span>` : '';
+  const decode = !r ? '<span class="dim">— no run yet</span>'
+    : `peak <b class="acc">${n(r.peak, 1)}</b> · avg <b>${n(r.avg, 1)}</b> tok/s · ${runDur(r.dur)}` +
+      ` · ${nk(r.tokens)} tok${liveTag(r)}`;
+  const prefill = !p ? '<span class="dim">— no prefill yet</span>'
+    : `peak <b class="acc">${nk(p.p_peak)}</b> · avg <b>${nk(p.p_avg)}</b> tok/s · ` +
+      `${nk(p.p_tok)} tok in ${n(p.p_time, 1)} s${liveTag(p)}`;
+  const kvTxt = d.kv_used && d.kv_cap ? ` · ${nk(d.kv_used)} / ${nk(d.kv_cap)} tokens` : '';
+  const genNow = d.tg !== null && d.tg !== undefined ? n(d.tg, 1) : '0.0';
+  const ppLast = d.pp_last !== null && d.pp_last !== undefined ? nk(d.pp_last) : '—';
+  return `
+    <h3>vLLM :${E(d.port)} ${pill}</h3>
+    <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''}${
+      d.ctx ? ' · ctx ' + nk(d.ctx) : ''}</div>
+    <div class="lbl"><span>KV cache</span><b>${n(d.kv_pct, 2)}%${kvTxt}</b></div>
+    ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
+    <div class="big">${genNow} <span>tok/s generated</span></div>
+    ${d.tg_series && d.tg_series.length > 1 ? spark(d.tg_series, 'var(--ok)') : ''}
+    ${row('decode ' + (r && r.live ? 'this run' : 'last run'), decode)}
+    <div class="big">${ppLast} <span>tok/s prefill, last completed request</span></div>
+    ${d.pp_series && d.pp_series.length > 1 ? spark(d.pp_series, 'var(--accent)') : ''}
+    ${row('prefill ' + (p && p.live ? 'this run' : 'last run'), prefill)}
+    ${row('cache reuse', rr ? `<b class="ok">${n(rr.frac * 100, 1)}%</b> of ${nk(rr.tokens)} prompt tokens · ${ago(rr.at)}`
+                            : '<span class="dim">—</span>')}
+    ${row('ingest', `${nk(d.ingest)} tok/s`)}
+    ${row('requests', `${n(d.active)} running / ${n(d.slots)} · ${n(d.queued)} waiting`)}
+    ${row('TTFT', `avg ${ms(d.ttft_avg)} · now ${ms(d.ttft_last)}`)}
+    ${row('TPOT · e2e', `${ms(d.tpot_avg)} · ${d.e2e_avg == null ? '—' : n(d.e2e_avg, 2) + ' s'}`)}
+    ${row('prefix cache (lifetime)', d.reuse == null ? '—' : n(d.reuse * 100, 1) + '%')}
+    ${row('draft accepted', d.spec_pct == null ? '—'
+        : `${n(d.spec_pct, 1)}%${d.spec_type ? ' · ' + E(d.spec_type) : ''}${d.spec_nmax ? ' · n ' + n(d.spec_nmax) : ''}`)}
+    ${row('avg prompt · answer', `${nk(d.prompt_avg)} · ${nk(d.answer_avg)} tok`)}
+    ${row('since start', `${nk(d.gen_total)} generated · ${nk(d.prompt_total)} prompt · ${nk(d.req_total)} requests`)}
+    ${d.preemptions ? row('preemptions', `<span class="warn">${n(d.preemptions)}</span>`) : ''}
+    ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
+    ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
+    ${d.kv_series && d.kv_series.length > 1
+      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
+}
 
 function procTable(ps){
   if (!ps || !ps.length) return '<div class="empty">No llama.cpp or vLLM processes detected.</div>';
@@ -964,7 +1033,7 @@ function render(s){
   mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
   mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
   mount('g-sys', 'pwr', powerLive(s), '', seen);
-  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, srvLive(d), srvExtra(d), seen));
+  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, d.flavor === 'vLLM' ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
   prune(seen);
 
   paint($('g-proc'), procTable(s.procs));

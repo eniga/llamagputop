@@ -711,8 +711,10 @@ class FakeClock:
 def vllm_metrics(running=0, waiting=0, gen=0, kv=0.0, hits=0, queries=0,
                  preempt=0, spec=True, drafts=0, dtok=0, acc=0, pos=(),
                  pf_tok=0, pf_s=0.0, pf_n=0, g_sum=0, g_n=0, dec_s=0.0,
-                 ttft_s=0.0, ttft_n=0, pool=591218):
-    """A /metrics body in vLLM's shape, labels and all."""
+                 ttft_s=0.0, ttft_n=0, pool=591218, prompt_total=None, cached_total=None,
+                 success=None, e2e_s=None, tpot_s=None):
+    """A /metrics body in vLLM's shape, labels and all. The newer counters are emitted
+    only when a test asks for them, so the older tests see exactly the body they did."""
     L = 'engine="0",model_name="m"'
     out = [
         "# HELP vllm:num_requests_running running",
@@ -735,6 +737,18 @@ def vllm_metrics(running=0, waiting=0, gen=0, kv=0.0, hits=0, queries=0,
         f'vllm:cache_config_info{{block_size="1664",{L},kv_cache_size_tokens="{pool}",'
         f'num_gpu_blocks="424"}} 1.0',
     ]
+    if prompt_total is not None:
+        out += [f"vllm:prompt_tokens_total{{{L}}} {prompt_total}",
+                f"vllm:prompt_tokens_cached_total{{{L}}} {cached_total or 0}",
+                f"vllm:request_prompt_tokens_count{{{L}}} {pf_n}"]
+    if success is not None:
+        out.append(f"vllm:request_success_total{{{L}}} {success}")
+    if e2e_s is not None:
+        out += [f"vllm:e2e_request_latency_seconds_sum{{{L}}} {e2e_s}",
+                f"vllm:e2e_request_latency_seconds_count{{{L}}} {g_n}"]
+    if tpot_s is not None:
+        out += [f"vllm:request_time_per_output_token_seconds_sum{{{L}}} {tpot_s}",
+                f"vllm:request_time_per_output_token_seconds_count{{{L}}} {g_n}"]
     if spec:
         out += [f"vllm:spec_decode_num_drafts_total{{{L}}} {drafts}",
                 f"vllm:spec_decode_num_draft_tokens_total{{{L}}} {dtok}",
@@ -908,6 +922,60 @@ class VllmProbeRates(Base):
         s = self.pr.sample()
         self.assertTrue(s["alive"])
         self.assertTrue(s["metrics_off"])
+
+    # ---- runs: live while work is happening, summarised once it stops
+    def test_a_run_is_live_while_it_lasts(self):
+        _pre, _g1, g2, _done = self.run_request()
+        r = g2["run"]
+        self.assertTrue(r["live"])
+        self.assertEqual(r["tokens"], 100)
+        self.assertAlmostEqual(r["peak"], 50.0)
+
+    def test_a_finished_run_is_summarised(self):
+        self.run_request()
+        s = self.tick(**dict(self.BASE, gen=210, g_sum=210, g_n=2, dec_s=4.18,
+                             pf_tok=4000, pf_s=2.5, pf_n=2, ttft_s=2.6, ttft_n=2))
+        r = s["run"]
+        self.assertFalse(r["live"])
+        self.assertEqual(r["tokens"], 110)     # 50 + 50 + the 10 that landed as it finished
+        self.assertAlmostEqual(r["avg"], 110 / 3.0)   # over the three ticks that decoded
+        self.assertAlmostEqual(r["peak"], 50.0)
+        self.assertAlmostEqual(r["dur"], 4.0)  # from the prefill tick to the idle one
+        self.assertIsNotNone(r["ended"])
+
+    def test_prefill_figures_come_from_completed_requests(self):
+        *_rest, done = self.run_request()
+        p = done["prun"]
+        self.assertEqual(p["p_tok"], 3000)
+        self.assertAlmostEqual(p["p_time"], 1.5)
+        self.assertAlmostEqual(p["p_avg"], 2000.0)
+        self.assertAlmostEqual(p["p_peak"], 2000.0)
+
+    def test_a_request_between_two_scrapes_is_still_a_run(self):
+        self.tick(**self.BASE)
+        self.tick(**dict(self.BASE, gen=130))  # never seen running: it began and ended
+        s = self.tick(**dict(self.BASE, gen=130))
+        self.assertEqual(s["run"]["tokens"], 30)
+        self.assertAlmostEqual(s["run"]["peak"], s["run"]["avg"])  # no slope: avg is all
+
+    def test_recent_reuse_and_ingest(self):
+        self.tick(**dict(self.BASE, prompt_total=1000, cached_total=0))
+        s = self.tick(**dict(self.BASE, prompt_total=5000, cached_total=3000))
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.75)
+        self.assertEqual(s["reuse_recent"]["tokens"], 4000)
+        self.assertAlmostEqual(s["ingest"], 4000.0)
+        s = self.tick(**dict(self.BASE, prompt_total=5000, cached_total=3000))
+        self.assertAlmostEqual(s["ingest"], 0.0)                # nothing new arrived
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.75)  # the last reuse is kept
+
+    def test_lifetime_means_and_totals(self):
+        s = self.tick(**dict(self.BASE, g_sum=600, g_n=3, ttft_s=1.5, ttft_n=3,
+                             e2e_s=30.0, tpot_s=0.06, success=3, prompt_total=9000, pf_n=3))
+        self.assertAlmostEqual(s["ttft_avg"], 0.5)
+        self.assertAlmostEqual(s["e2e_avg"], 10.0)
+        self.assertAlmostEqual(s["tpot_avg"], 0.02)
+        self.assertAlmostEqual(s["answer_avg"], 200.0)
+        self.assertEqual((s["gen_total"], s["prompt_total"], s["req_total"]), (100, 9000, 3))
 
     def test_a_counter_reset_is_not_a_negative_rate(self):
         self.tick(**dict(self.BASE, pf_tok=9000, pf_s=5.0, pf_n=3))

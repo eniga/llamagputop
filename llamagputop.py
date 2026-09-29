@@ -2190,12 +2190,32 @@ class VllmProbe(LlamaProbe):
         self._cmd = None
         self._cmd_at = 0.0
         self.ttft_n = None
+        self.run = None                    # the run in progress, see _run_summary
+        self.run_last = None               # the last finished run
+        self.prun_last = None              # the last finished run that completed a prefill
+        self._run_tick = None
+        self._pt = None                    # (prompt_tokens, cached, monotonic) last tick
+        self.reuse_recent = None
 
     def _blank(self):
         d = super()._blank()
         d.update(kv_pool=self.pool, preemptions=None, ttft_n=self.ttft_n,
-                 spec_stale=False, decoded=None, budget=0)
+                 spec_stale=False, decoded=None, budget=0,
+                 run=None, prun=None, reuse_recent=self.reuse_recent, ingest=None,
+                 ttft_avg=None, tpot_avg=None, e2e_avg=None, prompt_avg=None,
+                 answer_avg=None, gen_total=None, prompt_total=None, req_total=None)
         return d
+
+    @staticmethod
+    def _run_summary(r, now, live):
+        avg = r["gen"] / r["gen_t"] if r["gen_t"] > 0 else None
+        p_avg = r["p_tok"] / r["p_time"] if r["p_time"] > 0 else None
+        return {"live": live, "dur": now - r["t0"], "tokens": int(r["gen"]), "avg": avg,
+                # a run shorter than the slope window never gets a live rate: its average
+                # is then the only rate there is, and it is the peak too
+                "peak": r["peak"] if r["peak"] else avg,
+                "p_tok": int(r["p_tok"]), "p_time": r["p_time"], "p_avg": p_avg,
+                "p_peak": r["p_peak"], "ended": None if live else time.time()}
 
     def _cmdline(self):
         if self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL:
@@ -2301,9 +2321,41 @@ class VllmProbe(LlamaProbe):
             dec = dl(K[4]) - dl(K[5])      # the first token of each request is prefill's
             if dl(K[5]) > 0 and dl(K[6]) > 0 and dec > 0:
                 self.tg_last = dec / dl(K[6])
+        # prefill that COMPLETED since the last tick: exact, from the per-request timings
+        p_tok = p_time = 0.0
+        if self.hc and not restarted and dl(K[3]) > 0 and dl(K[2]) > 0:
+            p_tok, p_time = dl(ptok), dl(K[2])
         self.hc = c
         if c[K[2]]:
             d["pp_life"] = (c[ptok] or 0) / c[K[2]]
+        # ---- lifetime means and totals. Histograms move when a request finishes, so these
+        # describe completed requests; the totals are what the server has done since start.
+
+        def mean(stem):
+            a, b = tot(stem + "_sum"), tot(stem + "_count")
+            return a / b if a is not None and b else None
+        d["ttft_avg"] = mean("vllm:time_to_first_token_seconds")
+        d["tpot_avg"] = mean("vllm:request_time_per_output_token_seconds")
+        d["e2e_avg"] = mean("vllm:e2e_request_latency_seconds")
+        d["prompt_avg"] = mean("vllm:request_prompt_tokens")
+        d["answer_avg"] = mean("vllm:request_generation_tokens")
+        ptot, pcache = tot("vllm:prompt_tokens_total"), tot("vllm:prompt_tokens_cached_total")
+        d["prompt_total"], d["req_total"] = ptot, tot("vllm:request_success_total")
+        d["gen_total"] = tot("vllm:generation_tokens_total")
+        # Ingest and recent reuse. The prompt counters advance once per request, when its
+        # prefill completes (vLLM folds PrefillStats in per request, not per chunk), so
+        # ingest is a completion rate over the tick, and reuse is the cached share of the
+        # prompts that completed prefill in the most recent tick that had any.
+        if ptot is not None:
+            if self._pt is not None and ptot >= self._pt[0]:
+                dp = ptot - self._pt[0]
+                d["ingest"] = dp / max(now - self._pt[2], 1e-3)
+                if dp > 0:
+                    self.reuse_recent = {
+                        "frac": max(0.0, (pcache or 0) - (self._pt[1] or 0)) / dp,
+                        "tokens": int(dp), "at": time.time()}
+            self._pt = (ptot, pcache, now)
+        d["reuse_recent"] = self.reuse_recent
         if c[K[6]] and c[K[4]] is not None and c[K[5]] is not None:
             d["tg_life"] = (c[K[4]] - c[K[5]]) / c[K[6]]
         # ---- live generation rate and phase
@@ -2327,6 +2379,36 @@ class VllmProbe(LlamaProbe):
             self.tg = None
         else:
             self.tg = None
+        # ---- runs. A run is a stretch of ticks with work in it: a request running, tokens
+        # appearing, or a prefill completing. It ends on the first tick with none of those.
+        # Decode avg is the run's tokens over the ticks that produced them, so a wait on a
+        # prefill does not dilute it; peak is the highest live rate seen. The prefill half
+        # is built from the requests whose prefill completed during the run.
+        dgen = gen - self._glast if self._glast is not None and gen >= self._glast else 0.0
+        dt = now - self._run_tick if self._run_tick is not None else 0.0
+        self._run_tick = now
+        if busy or dgen > 0 or p_tok > 0:
+            r = self.run
+            if r is None:
+                r = self.run = {"t0": now - dt if not busy else now, "gen": 0.0, "gen_t": 0.0,
+                                "peak": None, "p_tok": 0.0, "p_time": 0.0, "p_peak": None}
+            if dgen > 0 and dt > 0:
+                r["gen"] += dgen
+                r["gen_t"] += dt
+            if self.tg:
+                r["peak"] = max(r["peak"] or 0.0, self.tg)
+            if p_time > 0:
+                r["p_tok"] += p_tok
+                r["p_time"] += p_time
+                r["p_peak"] = max(r["p_peak"] or 0.0, p_tok / p_time)
+        elif self.run is not None:
+            self.run_last = self._run_summary(self.run, now, live=False)
+            if self.run["p_time"] > 0:
+                self.prun_last = self.run_last
+            self.run = None
+        live = self._run_summary(self.run, now, live=True) if self.run else None
+        d["run"] = live if live and live["tokens"] else self.run_last
+        d["prun"] = live if live and live["p_time"] else self.prun_last
         self._glast, self._busy = gen, busy
         self.pp = None                     # not observable live, see the docstring
         d["phase"] = ("generating" if busy and advanced else "prefill" if busy
