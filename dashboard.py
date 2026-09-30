@@ -97,7 +97,7 @@ def _pcie_band(gts, width):
     return gts * width * eff / 8
 
 
-def pcie_for(pci_addr):
+def pcie_for(pci_addr, fw_width=None):
     """Current and maximum PCIe link for one card, plus the chain's narrowest hop.
 
     Read from sysfs rather than from nvidia-smi so it works for every vendor, and
@@ -105,24 +105,28 @@ def pcie_for(pci_addr):
     reasons: a link drops to 2.5 GT/s x8 when the card is idle (power management,
     it comes back under load), while a max width below the card's own x16 is
     physical — a bifurcated slot — and will not.
+
+    Both come from the chain's root port, the same link the terminal view reports. The
+    card's own node used to be read here instead, and on an R9700 that node describes the
+    hop to the switch on the card itself: 32 GT/s x16 while the slot ran x8, and a different
+    answer from the terminal view on the same screen.
     """
     if not pci_addr:
         return {}
     path = f"/sys/bus/pci/devices/{pci_addr}"
     if not os.path.exists(path):
         return {}
-    real = os.path.realpath(path)
-    cur = L._pcie_link(real)
-    mx = L._pcie_link_max(real)
     chain = L.pcie_chain(path)
     out = {}
-    if cur:
-        out["pcie_gts"], out["pcie_width"] = cur
-        out["pcie_gbs"] = _pcie_band(*cur)
-    if mx:
-        out["pcie_max_gts"], out["pcie_max_width"] = mx
-        out["pcie_max_gbs"] = _pcie_band(*mx)
     if chain:
+        if fw_width and fw_width < chain["width"]:
+            chain["fw_width"] = fw_width
+            out["pcie_fw_width"] = fw_width
+        out["pcie_gts"], out["pcie_width"] = chain["gts"], chain["width"]
+        out["pcie_gbs"] = chain["gbs"]
+        out["pcie_max_gts"], out["pcie_max_width"] = chain["max_gts"], chain["max_width"]
+        out["pcie_max_gbs"] = chain["max_gbs"]
+        out["pcie_virtual"] = chain["virtual"]
         out["pcie_bottleneck"] = chain.get("bottleneck")
         out["pcie_narrow_gbs"] = chain.get("narrow_gbs")
         out["pcie_text"] = L.pcie_text(chain)
@@ -348,7 +352,7 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         g["power_pct"] = _pct(s.get("power"), s.get("power_cap"))
         g["temp_state"] = _temp_state(s.get("temp_main"))
         g["util_state"] = _util_state(s.get("util"))
-        g.update(pcie_for(s.get("pci_addr")))
+        g.update(pcie_for(s.get("pci_addr"), s.get("pcie_fw_width")))
         tr = PCIE.get(s.get("pci_addr"))
         g["pcie_rx_mbs"] = tr[0] if tr else None
         g["pcie_tx_mbs"] = tr[1] if tr else None
@@ -592,6 +596,9 @@ h2:first-child{margin-top:0}
 .pill.on{color:var(--ok);border-color:rgba(63,185,80,.4)}
 .pill.off{color:var(--crit);border-color:rgba(248,81,73,.4)}
 .pill.busy{color:var(--ser);border-color:rgba(57,197,207,.4)}
+.big{font-size:22px;font-weight:650;margin-top:10px;line-height:1.1}
+.big span{font-size:12px;font-weight:400;color:var(--dim)}
+.live{color:var(--ok);border:1px solid rgba(63,185,80,.4);border-radius:20px;padding:0 6px;font-size:10.5px}
 svg.spark{display:block;width:100%;height:34px;margin-top:8px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
@@ -679,11 +686,11 @@ function rest(obj, shown){
 }
 
 const GPU_SHOWN = ['index','vendor','name','pci_addr','util','vram_used','vram_total',
-  'vram_pct','vram_free','temp_main','power','power_cap','power_pct','sclk','mclk',
+  'vram_pct','vram_free','temp_main','temp_main_label','power','power_cap','power_pct','sclk','mclk',
   'mem_util','util_state','temp_state','mem_clock_mhz',
   'pcie_gts','pcie_width','pcie_gbs','pcie_max_gts','pcie_max_width','pcie_max_gbs',
   'pcie_bottleneck','pcie_narrow_gbs','pcie_text','pcie_rx_mbs','pcie_tx_mbs',
-  'pcie_traffic_reason'];
+  'pcie_traffic_reason','pcie_virtual','pcie_fw_width'];
 
 function link(gts, w, gbs){
   if (gts === null || gts === undefined || !w) return '<span class="dim">—</span>';
@@ -702,7 +709,10 @@ function gpuLive(g){
     : `rx <b>${n(g.pcie_rx_mbs)}</b> · tx <b>${n(g.pcie_tx_mbs)}</b> MB/s`;
   // a link that is downtrained while idle is normal and comes back under load; a
   // max width below the card's own is physical and does not
-  const narrowed = g.pcie_width && g.pcie_max_width && g.pcie_width < g.pcie_max_width;
+  // an emulated root port's widths are QEMU's choice (x16 of x32), not a narrowed slot
+  const narrowed = !g.pcie_virtual && g.pcie_width && g.pcie_max_width
+    && g.pcie_width < g.pcie_max_width;
+  const virt = g.pcie_virtual ? ' <span class="dim">· virtual root port</span>' : '';
   return `
     <h3>GPU${g.index} · ${E(g.name || g.vendor || 'GPU')}</h3>
     <div class="sub">${E(g.vendor || '')} ${g.pci_addr ? '· ' + E(g.pci_addr) : ''}</div>
@@ -713,15 +723,18 @@ function gpuLive(g){
     <div class="lbl"><span>power</span><b>${n(g.power,1)} / ${n(g.power_cap)} W</b></div>
     ${bar(g.power_pct, g.power_pct >= 95 ? 'warn' : '')}
     <div style="margin-top:9px">
-      ${row('temperature', `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
+      ${row(g.temp_main_label ? `temperature (${g.temp_main_label})` : 'temperature',
+          `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
       ${temps ? row('sensors', E(temps)) : ''}
       ${row('core clock', n(g.sclk) + ' MHz')}
       ${row('VRAM free', n(g.vram_free) + ' MiB')}
     </div>
     <div class="lbl"><span>bandwidth</span><b></b></div>
     <div>
-      ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs))}
-      ${row('PCIe max', link(g.pcie_max_gts, g.pcie_max_width, g.pcie_max_gbs))}
+      ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs) + virt)}
+      ${row('PCIe max', link(g.pcie_max_gts, g.pcie_max_width, g.pcie_max_gbs) + virt)}
+      ${g.pcie_fw_width ? row('card link',
+          `<span class="warn">x${g.pcie_fw_width}</span> <span class="dim">· width the card's firmware reports</span>`) : ''}
       ${narrowed ? row('link width',
           `<span class="warn">running x${g.pcie_width} of x${g.pcie_max_width}</span>`) : ''}
       ${g.pcie_bottleneck
@@ -805,7 +818,10 @@ const SRV_SHOWN = ['port','pid','flavor','alive','stale','phase','model','pp','t
   'pp_last','tg_last','kv','kv_pct','spec','spec_pct','ctx','ctx_total','slots',
   'ctx_text','why_pp','why_tg','power_w','active','queued','ttft_last',
   'spec_acc','spec_draft','spec_type','spec_nmax','cache_hit','decoded',
-  'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life'];
+  'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life',
+  'kv_pool','preemptions','ttft_n','reuse',
+  'run','prun','reuse_recent','ingest','ttft_avg','tpot_avg','e2e_avg','prompt_avg',
+  'answer_avg','gen_total','prompt_total','req_total'];
 
 function srvLive(d){
   const state = !d.alive ? 'off' : d.stale ? 'busy'
@@ -819,22 +835,26 @@ function srvLive(d){
         ? `<b class="dim">${n(last, dec)}</b> <span class="dim">(last)</span>`
         : `<span class="dim">— ${E(why)}</span>`);
   return `
-    <h3>llama.cpp :${E(d.port)} ${pill}</h3>
+    <h3>${E(d.flavor || 'llama.cpp')} :${E(d.port)} ${pill}</h3>
     <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''} · ${E(d.flavor || '')}</div>
     ${row('generation t/s', sp(d.tg, d.tg_last, 1, d.why_tg))}
     ${row('prefill t/s', sp(d.pp, d.pp_last, 0, d.why_pp))}
-    ${row('TTFT', d.ttft_last === null || d.ttft_last === undefined ? '<span class="dim">—</span>' : n(d.ttft_last,2) + ' s')}
+    ${row('TTFT', d.ttft_last === null || d.ttft_last === undefined ? '<span class="dim">—</span>'
+        : n(d.ttft_last,2) + ' s' + (d.ttft_n > 1 ? ` <span class="dim">(mean of ${n(d.ttft_n)})</span>` : ''))}
     ${row('context', `<span class="mono">${E(d.ctx_text)}</span>`)}
     <div class="lbl"><span>KV cache</span><b>${pc(d.kv_pct)}${
       d.kv_used ? ` · ${n(d.kv_used)} cells` : ''}</b></div>
     ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
-    ${row('slots', `${n(d.active)} active / ${n(d.slots)} · ${n(d.queued)} queued`)}
+    ${row(d.kv_pool ? 'sequences' : 'slots', `${n(d.active)} active / ${n(d.slots)} · ${n(d.queued)} queued`)}
+    ${d.reuse === null || d.reuse === undefined ? '' : row('prompt reuse', pc(d.reuse * 100))}
+    ${d.preemptions === null || d.preemptions === undefined ? ''
+      : row('preemptions', d.preemptions > 0 ? `<span class="warn">${n(d.preemptions)}</span>` : n(d.preemptions))}
     ${row('speculative', d.spec_pct === null || d.spec_pct === undefined
         ? '<span class="dim">—</span>'
         : `${n(d.spec_pct)}% accepted${d.spec_type ? ' · ' + E(d.spec_type) : ''}${
             d.spec_nmax ? ' · n_max ' + n(d.spec_nmax) : ''}`)}
     ${row('cache hits', n(d.cache_hit))}
-    ${row('decoded', n(d.decoded) + ' tok')}
+    ${d.decoded === null || d.decoded === undefined ? '' : row('decoded', n(d.decoded) + ' tok')}
     ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
     ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
     ${d.slots_off ? row('slots endpoint', '<span class="warn">off</span>') : ''}
@@ -851,8 +871,72 @@ function srvLive(d){
 }
 function srvExtra(d){ return cfgBlock(d.config) + rest(d, SRV_SHOWN); }
 
+// ---------------------------------------------------------------- vLLM panel
+// vLLM reports whole requests, not slots, so its panel is built around runs (a stretch of
+// ticks with work in it) and the request histograms. Prefill is never live on vLLM: its
+// prompt counters move once per request, when that request's prefill completes, so the
+// prefill figures are per completed request and are labelled that way.
+const nk = v => v === null || v === undefined ? '—' : Math.round(v).toLocaleString('en-US');
+const ms = v => v === null || v === undefined ? '—' : nk(v * 1000) + ' ms';
+const ago = t => {
+  if (!t) return '';
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 60 ? `${Math.round(s)}s ago` : s < 3600 ? `${Math.round(s / 60)}m ago`
+    : `${(s / 3600).toFixed(1)}h ago`;
+};
+const runDur = s => s === null || s === undefined ? '—' : s < 60 ? `${Math.round(s)} s`
+  : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+
+function srvVllm(d){
+  const state = !d.alive ? 'off' : d.stale ? 'busy'
+    : (d.phase === 'generating' || d.phase === 'prefill') ? 'busy' : 'on';
+  const pill = !d.alive ? `<span class="pill off">offline</span>`
+    : d.stale ? `<span class="pill busy">no answer</span>`
+    : `<span class="pill ${state === 'busy' ? 'busy' : 'on'}">${E(d.phase || 'idle')}</span>`;
+  const r = d.run, p = d.prun, rr = d.reuse_recent;
+  const liveTag = x => x && x.live ? ' <span class="live">live</span>'
+    : x && x.ended ? ` <span class="dim">· ${ago(x.ended)}</span>` : '';
+  const decode = !r ? '<span class="dim">— no run yet</span>'
+    : `peak <b class="acc">${n(r.peak, 1)}</b> · avg <b>${n(r.avg, 1)}</b> tok/s · ${runDur(r.dur)}` +
+      ` · ${nk(r.tokens)} tok${liveTag(r)}`;
+  const prefill = !p ? '<span class="dim">— no prefill yet</span>'
+    : `peak <b class="acc">${nk(p.p_peak)}</b> · avg <b>${nk(p.p_avg)}</b> tok/s · ` +
+      `${nk(p.p_tok)} tok in ${n(p.p_time, 1)} s${liveTag(p)}`;
+  const kvTxt = d.kv_used && d.kv_cap ? ` · ${nk(d.kv_used)} / ${nk(d.kv_cap)} tokens` : '';
+  const genNow = d.tg !== null && d.tg !== undefined ? n(d.tg, 1) : '0.0';
+  const ppLast = d.pp_last !== null && d.pp_last !== undefined ? nk(d.pp_last) : '—';
+  return `
+    <h3>vLLM :${E(d.port)} ${pill}</h3>
+    <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''}${
+      d.ctx ? ' · ctx ' + nk(d.ctx) : ''}</div>
+    <div class="lbl"><span>KV cache</span><b>${n(d.kv_pct, 2)}%${kvTxt}</b></div>
+    ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
+    <div class="big">${genNow} <span>tok/s generated</span></div>
+    ${d.tg_series && d.tg_series.length > 1 ? spark(d.tg_series, 'var(--ok)') : ''}
+    ${row('decode ' + (r && r.live ? 'this run' : 'last run'), decode)}
+    <div class="big">${ppLast} <span>tok/s prefill, last completed request</span></div>
+    ${d.pp_series && d.pp_series.length > 1 ? spark(d.pp_series, 'var(--accent)') : ''}
+    ${row('prefill ' + (p && p.live ? 'this run' : 'last run'), prefill)}
+    ${row('cache reuse', rr ? `<b class="ok">${n(rr.frac * 100, 1)}%</b> of ${nk(rr.tokens)} prompt tokens · ${ago(rr.at)}`
+                            : '<span class="dim">—</span>')}
+    ${row('ingest', `${nk(d.ingest)} tok/s`)}
+    ${row('requests', `${n(d.active)} running / ${n(d.slots)} · ${n(d.queued)} waiting`)}
+    ${row('TTFT', `avg ${ms(d.ttft_avg)} · now ${ms(d.ttft_last)}`)}
+    ${row('TPOT · e2e', `${ms(d.tpot_avg)} · ${d.e2e_avg == null ? '—' : n(d.e2e_avg, 2) + ' s'}`)}
+    ${row('prefix cache (lifetime)', d.reuse == null ? '—' : n(d.reuse * 100, 1) + '%')}
+    ${row('draft accepted', d.spec_pct == null ? '—'
+        : `${n(d.spec_pct, 1)}%${d.spec_type ? ' · ' + E(d.spec_type) : ''}${d.spec_nmax ? ' · n ' + n(d.spec_nmax) : ''}`)}
+    ${row('avg prompt · answer', `${nk(d.prompt_avg)} · ${nk(d.answer_avg)} tok`)}
+    ${row('since start', `${nk(d.gen_total)} generated · ${nk(d.prompt_total)} prompt · ${nk(d.req_total)} requests`)}
+    ${d.preemptions ? row('preemptions', `<span class="warn">${n(d.preemptions)}</span>`) : ''}
+    ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
+    ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
+    ${d.kv_series && d.kv_series.length > 1
+      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
+}
+
 function procTable(ps){
-  if (!ps || !ps.length) return '<div class="empty">No llama.cpp processes detected.</div>';
+  if (!ps || !ps.length) return '<div class="empty">No llama.cpp or vLLM processes detected.</div>';
   return `<div class="card"><div class="wrap"><table>
     <tr><th>pid</th><th>name</th><th>model</th><th>RSS MiB</th><th>VRAM MiB</th>
         <th>GTT</th><th>GPU</th><th>source</th><th>note</th></tr>` +
@@ -904,7 +988,7 @@ function skeleton(){
   // card into its grid by id, so the two are independent and the render order below
   // can stay grouped by kind.
   b.innerHTML =
-    `<h2>llama.cpp servers</h2><div class="grid" id="g-srv"></div>` +
+    `<h2>Inference servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
     `<h2>System</h2><div class="grid" id="g-sys"></div>` +
     `<h2>Processes</h2><div id="g-proc"></div>` +
@@ -959,7 +1043,7 @@ function render(s){
   mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
   mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
   mount('g-sys', 'pwr', powerLive(s), '', seen);
-  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, srvLive(d), srvExtra(d), seen));
+  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, d.flavor === 'vLLM' ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
   prune(seen);
 
   paint($('g-proc'), procTable(s.procs));

@@ -693,5 +693,432 @@ class SeriesRetirement(Base):
         self.assertIn("kv_series@%s" % self.LIVE, lgt.HIST)
 
 
+# =============================================================================
+class FakeClock:
+    """time.monotonic under test control, so a rate over one second is exactly one
+    second and the suite does not sleep."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def vllm_metrics(running=0, waiting=0, gen=0, kv=0.0, hits=0, queries=0,
+                 preempt=0, spec=True, drafts=0, dtok=0, acc=0, pos=(),
+                 pf_tok=0, pf_s=0.0, pf_n=0, g_sum=0, g_n=0, dec_s=0.0,
+                 ttft_s=0.0, ttft_n=0, pool=591218, prompt_total=None, cached_total=None,
+                 success=None, e2e_s=None, tpot_s=None):
+    """A /metrics body in vLLM's shape, labels and all. The newer counters are emitted
+    only when a test asks for them, so the older tests see exactly the body they did."""
+    L = 'engine="0",model_name="m"'
+    out = [
+        "# HELP vllm:num_requests_running running",
+        f"vllm:num_requests_running{{{L}}} {running}",
+        f"vllm:num_requests_waiting{{{L}}} {waiting}",
+        f"vllm:kv_cache_usage_perc{{{L}}} {kv}",
+        f"vllm:prefix_cache_queries_total{{{L}}} {queries}",
+        f"vllm:prefix_cache_hits_total{{{L}}} {hits}",
+        f"vllm:num_preemptions_total{{{L}}} {preempt}",
+        f"vllm:generation_tokens_total{{{L}}} {gen}",
+        f"vllm:request_prefill_kv_computed_tokens_sum{{{L}}} {pf_tok}",
+        f"vllm:request_prompt_tokens_sum{{{L}}} {pf_tok}",
+        f"vllm:request_prefill_time_seconds_sum{{{L}}} {pf_s}",
+        f"vllm:request_prefill_time_seconds_count{{{L}}} {pf_n}",
+        f"vllm:request_generation_tokens_sum{{{L}}} {g_sum}",
+        f"vllm:request_generation_tokens_count{{{L}}} {g_n}",
+        f"vllm:request_decode_time_seconds_sum{{{L}}} {dec_s}",
+        f"vllm:time_to_first_token_seconds_sum{{{L}}} {ttft_s}",
+        f"vllm:time_to_first_token_seconds_count{{{L}}} {ttft_n}",
+        f'vllm:cache_config_info{{block_size="1664",{L},kv_cache_size_tokens="{pool}",'
+        f'num_gpu_blocks="424"}} 1.0',
+    ]
+    if prompt_total is not None:
+        out += [f"vllm:prompt_tokens_total{{{L}}} {prompt_total}",
+                f"vllm:prompt_tokens_cached_total{{{L}}} {cached_total or 0}",
+                f"vllm:request_prompt_tokens_count{{{L}}} {pf_n}"]
+    if success is not None:
+        out.append(f"vllm:request_success_total{{{L}}} {success}")
+    if e2e_s is not None:
+        out += [f"vllm:e2e_request_latency_seconds_sum{{{L}}} {e2e_s}",
+                f"vllm:e2e_request_latency_seconds_count{{{L}}} {g_n}"]
+    if tpot_s is not None:
+        out += [f"vllm:request_time_per_output_token_seconds_sum{{{L}}} {tpot_s}",
+                f"vllm:request_time_per_output_token_seconds_count{{{L}}} {g_n}"]
+    if spec:
+        out += [f"vllm:spec_decode_num_drafts_total{{{L}}} {drafts}",
+                f"vllm:spec_decode_num_draft_tokens_total{{{L}}} {dtok}",
+                f"vllm:spec_decode_num_accepted_tokens_total{{{L}}} {acc}"]
+        out += [f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{{L},position="{i}"}} {v}'
+                for i, v in enumerate(pos)]
+    return "\n".join(out) + "\n"
+
+
+class VllmCommandLine(Base):
+    """What a vLLM command line says, read without a process running."""
+
+    CMD = ["/opt/vllm/bin/python3", "/opt/vllm/bin/vllm", "serve",
+           "/models/unsloth/Qwen3.8-27B-FP8", "--served-model-name=Qwen3.8-27B-FP8",
+           "--tensor-parallel-size=2", "--max-num-seqs=8", "--api-key=secret123",
+           "--host=0.0.0.0", "--port=8000",
+           '--speculative-config={"method":"mtp","num_speculative_tokens":8}']
+
+    def test_equals_form_is_a_flag_and_a_value(self):
+        pairs = lgt._parse_cmdline_flags(["x", "--port=8000", "--tp", "2"])
+        self.assertEqual(pairs, [("--port", "8000"), ("--tp", "2")])
+
+    def test_a_llama_value_with_an_equals_sign_is_left_alone(self):
+        pairs = lgt._parse_cmdline_flags(["llama-server", "-ot", "blk=CPU"])
+        self.assertEqual(pairs, [("-ot", "blk=CPU")])
+
+    def test_port_host_and_served_name(self):
+        srv = lgt.vllm_from_cmd(self.CMD, 42)
+        self.assertEqual((srv["port"], srv["host"], srv["model_hint"], srv["kind"]),
+                         ("8000", "127.0.0.1", "Qwen3.8-27B-FP8", "vllm"))
+
+    def test_default_port_is_vllms_not_llamas(self):
+        self.assertEqual(lgt.vllm_from_cmd(["vllm", "serve", "/m/x"])["port"], "8000")
+
+    def test_positional_model_when_no_served_name(self):
+        self.assertEqual(lgt.vllm_from_cmd(["vllm", "serve", "/m/org/Model/"])["model_hint"],
+                         "Model")
+
+    def test_only_the_api_server_is_a_vllm_server(self):
+        self.assertTrue(lgt._is_vllm("vllm", ["vllm", "serve", "m"]))
+        self.assertFalse(lgt._is_vllm("VLLM::Worker_TP", ["VLLM::Worker_TP0"]))
+        self.assertFalse(lgt._is_vllm("vllm", ["vllm", "bench"]))
+
+    def test_mtp_head_is_native(self):
+        self.assertEqual(lgt.vllm_spec_from_cmd(self.CMD), ("mtp", "native (in model)", "8"))
+
+    def test_a_draft_model_is_named(self):
+        cmd = ['--speculative-config={"method":"dflash","model":"/m/DFlash2/","num_speculative_tokens":7}']
+        self.assertEqual(lgt.vllm_spec_from_cmd(cmd), ("dflash", "DFlash2", "7"))
+
+    def test_no_speculation_is_absent_not_a_default(self):
+        self.assertEqual(lgt.vllm_spec_from_cmd(["vllm", "serve", "m"]), (None, None, None))
+
+    def test_config_panel_groups_and_masks(self):
+        cfg = dict((g, dict(rows)) for g, rows in lgt.vllm_settings_from_cmd(self.CMD).items())
+        self.assertEqual(cfg["loading"]["model"], "Qwen3.8-27B-FP8")
+        self.assertEqual(cfg["scheduling"]["max-seqs"], "8")
+        self.assertNotIn("secret123", cfg["server"]["api-key"])
+
+    def test_prometheus_labels_are_parsed_not_kept_in_the_name(self):
+        m = lgt.prom_parse('a:b{x="1",position="3"} 2.5\n# c\nplain 1\n')
+        self.assertEqual(m["a:b"], [({"x": "1", "position": "3"}, 2.5)])
+        self.assertEqual(m["plain"], [({}, 1.0)])
+
+
+class VllmProbeRates(Base):
+    """The probe against a scripted /metrics sequence and a fake clock."""
+
+    def setUp(self):
+        super().setUp()
+        self._time = lgt.time
+        self.clock = FakeClock()
+        lgt.time = self.clock
+        self.pr = lgt.VllmProbe("8000")
+        self.pr._cmdline = lambda: VllmCommandLine.CMD
+        self.body = ""
+        self.models = '{"data":[{"id":"Qwen3.8-27B-FP8","max_model_len":262144}]}'
+        self.pr._get = lambda path, timeout=2.5: (
+            self.models if path == "/v1/models" else self.body)
+
+    def tearDown(self):
+        lgt.time = self._time
+        super().tearDown()
+
+    def tick(self, dt=1.0, **kw):
+        self.clock.t += dt
+        self.body = vllm_metrics(**kw)
+        return self.pr.sample()
+
+    BASE = dict(gen=100, pf_tok=1000, pf_s=1.0, pf_n=1, g_sum=100, g_n=1, dec_s=2.0,
+                ttft_s=1.0, ttft_n=1, drafts=10, dtok=80, acc=30, pos=(8, 6))
+
+    def run_request(self):
+        b = dict(self.BASE)
+        self.tick(**b)                                          # idle baseline
+        pre = self.tick(**dict(b, running=1, kv=0.07))          # prefill: no token yet
+        g1 = self.tick(**dict(b, running=1, kv=0.07, gen=150))  # first tokens
+        g2 = self.tick(**dict(b, running=1, kv=0.07, gen=200))  # one second later
+        done = self.tick(**dict(b, gen=210, kv=0.07, pf_tok=4000, pf_s=2.5, pf_n=2,
+                                g_sum=210, g_n=2, dec_s=4.18, ttft_s=2.6, ttft_n=2))
+        return pre, g1, g2, done
+
+    def test_phases_follow_the_generation_counter(self):
+        pre, g1, g2, done = self.run_request()
+        self.assertEqual([s["phase"] for s in (pre, g1, g2, done)],
+                         ["prefill", "generating", "generating", "idle"])
+
+    def test_live_rate_is_the_counter_slope(self):
+        _pre, g1, g2, _done = self.run_request()
+        self.assertIsNone(g1["tg"])            # one point is not a rate
+        self.assertAlmostEqual(g2["tg"], 50.0)
+
+    def test_prefill_is_never_a_live_rate(self):
+        for s in self.run_request():
+            self.assertIsNone(s["pp"])
+
+    def test_completed_request_rates_come_from_the_histograms(self):
+        *_rest, done = self.run_request()
+        self.assertAlmostEqual(done["pp_last"], 3000 / 1.5)
+        self.assertAlmostEqual(done["ttft_last"], 1.6)
+        # 110 tokens, the first of them prefill's, over 2.18 s of decode
+        self.assertAlmostEqual(done["tg_last"], 109 / 2.18)
+        self.assertIsNone(done["tg"])
+
+    def test_kv_is_the_pool_fraction_in_tokens(self):
+        _pre, _g1, g2, _done = self.run_request()
+        self.assertAlmostEqual(g2["kv"], 0.07)
+        self.assertEqual(g2["kv_cap"], 591218)
+        self.assertEqual(g2["kv_used"], round(0.07 * 591218))
+
+    def test_speculative_counters(self):
+        s = self.tick(**self.BASE)
+        self.assertAlmostEqual(s["spec"], 30 / 80)
+        self.assertAlmostEqual(s["tok_step"], 1 + 30 / 10)
+        self.assertEqual(s["spec_pos"], [0.8, 0.6])
+        self.assertEqual(s["spec_type"], "mtp")
+
+    def test_model_and_context_from_the_api(self):
+        s = self.tick(**self.BASE)
+        self.assertEqual((s["model"], s["ctx"], s["slots"]), ("Qwen3.8-27B-FP8", 262144, 8))
+
+    # ---- the pairs: absent stays absent, zero stays zero
+    def test_no_speculation_counters_is_not_zero_acceptance(self):
+        s = self.tick(**dict(self.BASE, spec=False))
+        self.assertIsNone(s["spec"])
+        self.assertIsNone(s["tok_step"])
+
+    def test_zero_prefix_hits_is_a_real_zero(self):
+        s = self.tick(**dict(self.BASE, queries=500, hits=0))
+        self.assertEqual(s["reuse"], 0.0)
+
+    def test_no_prefix_lookups_is_no_reuse_figure(self):
+        s = self.tick(**dict(self.BASE, queries=0, hits=0))
+        self.assertIsNone(s["reuse"])
+
+    def test_an_empty_cache_reads_zero_not_absent(self):
+        s = self.tick(**self.BASE)
+        self.assertEqual(s["kv"], 0.0)
+        self.assertEqual(s["preemptions"], 0)
+
+    def test_idle_server_has_no_live_rate_and_no_invented_last(self):
+        s = self.tick(**self.BASE)
+        s = self.tick(**self.BASE)
+        self.assertIsNone(s["tg"])
+        self.assertIsNone(s["tg_last"])
+        self.assertEqual(s["phase"], "idle")
+
+    def test_a_server_without_vllm_counters_says_so(self):
+        self.clock.t += 1
+        self.body = "process_cpu_seconds_total 1.0\n"
+        s = self.pr.sample()
+        self.assertTrue(s["alive"])
+        self.assertTrue(s["metrics_off"])
+
+    # ---- runs: live while work is happening, summarised once it stops
+    def test_a_run_is_live_while_it_lasts(self):
+        _pre, _g1, g2, _done = self.run_request()
+        r = g2["run"]
+        self.assertTrue(r["live"])
+        self.assertEqual(r["tokens"], 100)
+        self.assertAlmostEqual(r["peak"], 50.0)
+
+    def test_a_finished_run_is_summarised(self):
+        self.run_request()
+        s = self.tick(**dict(self.BASE, gen=210, g_sum=210, g_n=2, dec_s=4.18,
+                             pf_tok=4000, pf_s=2.5, pf_n=2, ttft_s=2.6, ttft_n=2))
+        r = s["run"]
+        self.assertFalse(r["live"])
+        self.assertEqual(r["tokens"], 110)     # 50 + 50 + the 10 that landed as it finished
+        self.assertAlmostEqual(r["avg"], 110 / 3.0)   # over the three ticks that decoded
+        self.assertAlmostEqual(r["peak"], 50.0)
+        self.assertAlmostEqual(r["dur"], 4.0)  # from the prefill tick to the idle one
+        self.assertIsNotNone(r["ended"])
+
+    def test_prefill_figures_come_from_completed_requests(self):
+        *_rest, done = self.run_request()
+        p = done["prun"]
+        self.assertEqual(p["p_tok"], 3000)
+        self.assertAlmostEqual(p["p_time"], 1.5)
+        self.assertAlmostEqual(p["p_avg"], 2000.0)
+        self.assertAlmostEqual(p["p_peak"], 2000.0)
+
+    def test_a_request_between_two_scrapes_is_still_a_run(self):
+        self.tick(**self.BASE)
+        self.tick(**dict(self.BASE, gen=130))  # never seen running: it began and ended
+        s = self.tick(**dict(self.BASE, gen=130))
+        self.assertEqual(s["run"]["tokens"], 30)
+        self.assertAlmostEqual(s["run"]["peak"], s["run"]["avg"])  # no slope: avg is all
+
+    def test_recent_reuse_and_ingest(self):
+        self.tick(**dict(self.BASE, prompt_total=1000, cached_total=0))
+        s = self.tick(**dict(self.BASE, prompt_total=5000, cached_total=3000))
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.75)
+        self.assertEqual(s["reuse_recent"]["tokens"], 4000)
+        self.assertAlmostEqual(s["ingest"], 4000.0)
+        s = self.tick(**dict(self.BASE, prompt_total=5000, cached_total=3000))
+        self.assertAlmostEqual(s["ingest"], 0.0)                # nothing new arrived
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.75)  # the last reuse is kept
+
+    def test_lifetime_means_and_totals(self):
+        s = self.tick(**dict(self.BASE, g_sum=600, g_n=3, ttft_s=1.5, ttft_n=3,
+                             e2e_s=30.0, tpot_s=0.06, success=3, prompt_total=9000, pf_n=3))
+        self.assertAlmostEqual(s["ttft_avg"], 0.5)
+        self.assertAlmostEqual(s["e2e_avg"], 10.0)
+        self.assertAlmostEqual(s["tpot_avg"], 0.02)
+        self.assertAlmostEqual(s["answer_avg"], 200.0)
+        self.assertEqual((s["gen_total"], s["prompt_total"], s["req_total"]), (100, 9000, 3))
+
+    def test_a_counter_reset_is_not_a_negative_rate(self):
+        self.tick(**dict(self.BASE, pf_tok=9000, pf_s=5.0, pf_n=3))
+        s = self.tick(**self.BASE)             # server restarted: totals fell
+        self.assertIsNone(s["pp_last"])
+
+    def test_context_line_names_the_pool(self):
+        s = self.tick(**self.BASE)
+        self.assertEqual(lgt._ctx_text(s),
+                         "ctx 262144/request · pool 591218 tok · 8 seqs max")
+
+
+class UnreadableProcessReason(Base):
+    """A process whose fdinfo cannot be read says why, and the right why."""
+
+    @staticmethod
+    def why(**kw):
+        p = {"pid": "1", "name": "VLLM::Worker_TP", "model": "", "rss": 1, "read": False,
+             "error": "oserror", "caps": ["cap 0", "cap_sys_ptrace"], "gpu_accel": False}
+        p.update(kw)
+        return "".join(t for t, _a in lgt._llama_proc_rows([p], 120)[0])
+
+    def test_a_root_process_is_blamed_on_ownership_not_capabilities(self):
+        if os.geteuid() == 0:
+            self.skipTest("running as root: every process is ours")
+        self.assertIn("owned by root", self.why(uid=0))
+
+    def test_our_own_capable_binary_still_names_the_capability(self):
+        self.assertIn("non-dumpable", self.why(uid=os.geteuid()))
+
+
+class PcieChainInAVm(Base):
+    """Inside a VM the chain's root is QEMU's port and its link is invented by QEMU.
+
+    Measured 2026-09-29 on two passed-through R9700s: the card nodes read 32 GT/s x16,
+    the emulated root ports 16 GT/s x16 (max x32), the physical slots 32 GT/s x8, and
+    only the card's gpu_metrics blob carried the 8.
+    """
+
+    def tree(self, root_vendor):
+        root = os.path.join(self.root, "0000:00:1c.0")
+        card = os.path.join(root, "0000:01:00.0")
+        os.makedirs(card)
+        for path, cur, mx in ((root, ("16.0 GT/s PCIe", 16), ("16.0 GT/s PCIe", 32)),
+                              (card, ("32.0 GT/s PCIe", 16), ("32.0 GT/s PCIe", 16))):
+            self.write(os.path.join(path, "current_link_speed"), cur[0])
+            self.write(os.path.join(path, "current_link_width"), cur[1])
+            self.write(os.path.join(path, "max_link_speed"), mx[0])
+            self.write(os.path.join(path, "max_link_width"), mx[1])
+        self.write(os.path.join(root, "vendor"), root_vendor)
+        return card
+
+    def test_the_root_port_link_is_the_one_reported(self):
+        link = lgt.pcie_chain(self.tree("0x1b36"))
+        self.assertEqual((link["gts"], link["width"]), (16.0, 16))
+        self.assertEqual((link["max_gts"], link["max_width"]), (16.0, 32))
+
+    def test_a_qemu_root_port_is_flagged_virtual(self):
+        self.assertTrue(lgt.pcie_chain(self.tree("0x1b36"))["virtual"])
+
+    def test_a_real_root_port_is_not_flagged(self):
+        self.assertFalse(lgt.pcie_chain(self.tree("0x8086"))["virtual"])
+
+    def test_the_text_says_virtual_and_gives_the_firmware_width(self):
+        link = lgt.pcie_chain(self.tree("0x1b36"))
+        link["fw_width"] = 8
+        text = lgt.pcie_text(link)
+        self.assertIn("virtual root port", text)
+        self.assertIn("card firmware reports x8", text)
+
+    def test_a_plain_link_carries_no_notes(self):
+        self.assertNotIn("(", lgt.pcie_text(lgt.pcie_chain(self.tree("0x8086"))))
+
+
+class AmdFirmwareLinkWidth(Base):
+    """gpu_metrics v1_3 pcie_link_width, offset 74."""
+
+    def blob(self, content_rev, width):
+        import struct
+        d = bytearray(120)
+        struct.pack_into("<HBB", d, 0, 120, 1, content_rev)
+        struct.pack_into("<H", d, 74, width)
+        struct.pack_into("<Q", d, 112, 0)
+        card = os.path.join(self.root, f"c{content_rev}w{width}")
+        os.makedirs(os.path.join(card, "device"))
+        with open(os.path.join(card, "device", "gpu_metrics"), "wb") as f:
+            f.write(bytes(d))
+        return lgt._amd_gpu_metrics(card)
+
+    def test_the_width_is_read(self):
+        self.assertEqual(self.blob(3, 8).get("pcie_fw_width"), 8)
+
+    def test_a_zero_width_is_not_a_width(self):
+        self.assertIsNone(self.blob(3, 0).get("pcie_fw_width"))
+
+    def test_an_unsupported_marker_is_not_a_width(self):
+        self.assertIsNone(self.blob(3, 0xFFFF).get("pcie_fw_width"))
+
+    def test_older_layouts_are_not_read_at_that_offset(self):
+        self.assertNotIn("pcie_fw_width", self.blob(1, 8))
+
+
+class AmdVrmTemperatures(Base):
+    """gpu_metrics v1_3 temperature_vrgfx/vrsoc/vrmem, offsets 10, 12 and 14."""
+
+    def card_with(self, vrgfx, vrsoc, vrmem):
+        import struct
+        d = bytearray(120)
+        struct.pack_into("<HBB", d, 0, 120, 1, 3)
+        struct.pack_into("<HHH", d, 10, vrgfx, vrsoc, vrmem)
+        struct.pack_into("<Q", d, 112, 0)
+        card = self.card(f"v{vrgfx}-{vrsoc}-{vrmem}", dev={},
+                         hwmon={"temp1_label": "edge", "temp1_input": 50000})
+        with open(os.path.join(card, "device", "gpu_metrics"), "wb") as f:
+            f.write(bytes(d))
+        return lgt.AmdGpu(card, "Fixture").sample()
+
+    def test_all_three_regulators_join_the_temperatures(self):
+        t = self.card_with(56, 57, 58)["temp"]
+        self.assertEqual((t["vrm gfx"], t["vrm soc"], t["vrm mem"]), (56, 57, 58))
+
+    def test_the_memory_regulator_is_its_own_field(self):
+        self.assertEqual(self.card_with(56, 57, 58)["vrm_temp_mem"], 58)
+
+    def test_an_unsupported_marker_is_not_a_temperature(self):
+        s = self.card_with(56, 57, 0xFFFF)
+        self.assertIsNone(s["vrm_temp_mem"])
+        self.assertNotIn("vrm mem", s["temp"])
+
+
+class AmdHeadlineSensor(Base):
+    """The headline temperature says which sensor it is."""
+
+    def test_junction_is_named_when_it_is_the_headline(self):
+        card = self.card("j", dev={}, hwmon={"temp1_label": "edge", "temp1_input": 66000,
+                                             "temp2_label": "junction", "temp2_input": 91000})
+        s = lgt.AmdGpu(card, "Fixture").sample()
+        self.assertEqual((s["temp_main"], s["temp_main_label"]), (91, "junction"))
+
+    def test_edge_is_named_when_it_is_the_only_sensor(self):
+        card = self.card("e", dev={}, hwmon={"temp1_label": "edge", "temp1_input": 66000})
+        self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["temp_main_label"], "edge")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
