@@ -19,6 +19,10 @@ belonging to either, so its date is the repository's first day rather than a rel
 
 ### Fixed
 
+* AMD power was one read of `power1_average` per refresh. The SMU refreshes that value about every 50 ms, so a single read caught whatever that window held: on two R9700s capped at 240 W under sustained load, reads ranged 201 to 290 W around a true mean of 238.5 W, and the power peak, a running maximum, kept the spikes. A background reader now samples each card ten times a second and each refresh shows the mean of what it saw, the way amdgpu_top builds its figure. There is no energy counter on these cards to difference instead.
+
+* The AMD fan percentage was the pwm duty cycle, shown beside the rpm as if it measured the same thing. It is now the rpm as a share of the fan's declared top speed (`fan1_max`, 5100 rpm on an R9700). Duty ran 1 to 3 points higher than that and the gap grew with speed, since fan speed is not linear in duty. Cards that declare no top speed still show duty.
+
 * The dashboard and the terminal view reported different PCIe links for the same card. The terminal view took the chain's root port and the dashboard took the card's own node, and on a Radeon AI PRO R9700 the card's node describes the hop to the switch on the card itself: 32 GT/s x16 while the slot ran x8. Both now report the root port, the link the chain's own docstring already called the only stable value.
 
 * Inside a VM that root port is QEMU's emulated one, and its link is whatever QEMU advertises: 16 GT/s x16 with a maximum of x32 on two passed-through R9700s whose physical slots are 32 GT/s x8. It is now marked as a virtual root port instead of being read as the slot, and the "running x16 of x32" warning it used to trigger is suppressed, since no slot is narrowed. The width the card's own firmware sees is read from `gpu_metrics` (`pcie_link_width`, v1_3) and shown beside it, because in a VM that is the only place the physical width appears. The neighbouring `pcie_link_speed` field is not used: it read 2.5 GT/s under full load on the same card.
