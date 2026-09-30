@@ -1106,6 +1106,49 @@ class AmdVrmTemperatures(Base):
         self.assertNotIn("vrm mem", s["temp"])
 
 
+class AmdPowerAverage(Base):
+    """Power is the mean over the refresh interval, not one read."""
+
+    def test_the_feed_averages_what_it_sampled_and_resets(self):
+        f = lgt._AmdPowerFeed(["h"])
+        f._acc["h"] = [201.0 + 290.0 + 238.0, 3]
+        self.assertAlmostEqual(f.take("h"), 243.0)
+        self.assertIsNone(f.take("h"))
+
+    def test_the_sample_uses_the_feed_mean(self):
+        card = self.card("pf", dev={}, hwmon={"power1_average": 290000000})
+        f = lgt._AmdPowerFeed([])
+        g = lgt.AmdGpu(card, "Fixture", f)
+        f._acc[g.hw] = [476.0, 2]
+        self.assertEqual(g.sample()["power"], 238.0)
+
+    def test_without_samples_it_reads_once(self):
+        card = self.card("p1", dev={}, hwmon={"power1_average": 240000000})
+        g = lgt.AmdGpu(card, "Fixture", lgt._AmdPowerFeed([]))
+        self.assertEqual(g.sample()["power"], 240.0)
+
+    def test_without_a_feed_it_reads_once(self):
+        card = self.card("p0", dev={}, hwmon={"power1_average": 240000000})
+        self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["power"], 240.0)
+
+
+class AmdFanPercent(Base):
+    """The fan percentage is rpm over the declared top speed, pwm duty only as a fallback."""
+
+    def test_percent_of_top_speed(self):
+        card = self.card("f1", dev={}, hwmon={"fan1_input": 1811, "fan1_max": 5100, "pwm1": 99})
+        s = lgt.AmdGpu(card, "Fixture").sample()
+        self.assertEqual((s["fan_rpm"], s["fan_pct"]), (1811, 36))
+
+    def test_a_stopped_fan_is_zero_percent(self):
+        card = self.card("f0", dev={}, hwmon={"fan1_input": 0, "fan1_max": 5100, "pwm1": 0})
+        self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["fan_pct"], 0)
+
+    def test_duty_when_no_top_speed_is_declared(self):
+        card = self.card("fd", dev={}, hwmon={"fan1_input": 1811, "pwm1": 99})
+        self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["fan_pct"], 39)
+
+
 class AmdHeadlineSensor(Base):
     """The headline temperature says which sensor it is."""
 

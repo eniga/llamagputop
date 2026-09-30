@@ -342,14 +342,60 @@ def _hwmon_temp_labels(hw):
     return out
 
 
+class _AmdPowerFeed(threading.Thread):
+    """Average each AMD card's power over the refresh interval instead of taking one read.
+
+    power1_average is the SMU's own short average and changes about every 50 ms. Read once
+    per refresh it lands on whatever that window held: on two R9700s capped at 240 W under
+    sustained decode the single reads ranged 201 to 290 W around a true mean of 238.5, one
+    read in a second was a median 1.7 W and at worst 9.6 W off that second's mean, and the
+    power peak, a running max, kept the spikes. There is no energy counter to difference
+    (no energy1_input, and gpu_metrics' energy_accumulator reads 0), so the mean is built
+    the way amdgpu_top builds its figure: sample often, average what the interval saw.
+    """
+    PERIOD = 0.1
+
+    def __init__(self, hwmons):
+        super().__init__(daemon=True)
+        self.hwmons = list(hwmons)
+        self.stop = False
+        self._lock = threading.Lock()
+        self._acc = {h: [0.0, 0] for h in self.hwmons}
+
+    def run(self):
+        while not self.stop:
+            for h in self.hwmons:
+                v = read_int(f"{h}/power1_average", None)
+                if v is not None:
+                    with self._lock:
+                        a = self._acc[h]
+                        a[0] += v / 1e6
+                        a[1] += 1
+            time.sleep(self.PERIOD)
+
+    def take(self, hw):
+        """Mean power since the last take for this card, or None when nothing was read."""
+        with self._lock:
+            a = self._acc.get(hw)
+            if not a or not a[1]:
+                return None
+            mean = a[0] / a[1]
+            a[0], a[1] = 0.0, 0
+        return mean
+
+
 class AmdGpu:
     vendor = "AMD"
 
-    def __init__(self, card, name):
+    def __init__(self, card, name, power_feed=None):
         self.card = card
         self.name = name
         self.dev = f"{card}/device"
         self.hw = _hwmon_of(card)
+        self.power_feed = power_feed
+        # the fan's top speed as the driver declares it (5100 rpm on an R9700); absent or 0
+        # on cards that do not publish it, and then the percentage falls back to pwm duty
+        self.fan_max = read_int(f"{self.hw}/fan1_max", 0) if self.hw else 0
         self.temp_labels = _hwmon_temp_labels(self.hw)
         # per-sensor critical and emergency thresholds declared by the driver, better
         # than an invented number for colouring the temperatures
@@ -402,8 +448,12 @@ class AmdGpu:
         # and nvtop shows edge, so an unlabelled "91 °C" beside nvtop's "66 °C" reads as a bug
         d["temp_main_label"] = self._guide
         if self.hw:
-            d["power"] = sane(f"{self.card}.w",
-                              read_int(f"{self.hw}/power1_average") / 1e6, 0.1, 800)
+            # the interval mean when the feed has samples, one read when it has none (first
+            # tick, or a caller that built the card without a feed)
+            _w = self.power_feed.take(self.hw) if self.power_feed else None
+            if _w is None:
+                _w = read_int(f"{self.hw}/power1_average") / 1e6
+            d["power"] = sane(f"{self.card}.w", _w, 0.1, 800)
             d["power_cap"] = read_int(f"{self.hw}/power1_cap") // 1000000 or None
             # vddgfx has been seen at 6 mV while the card drew 8 W: below 400 it is
             # not a reading
@@ -415,8 +465,16 @@ class AmdGpu:
             # a stopped fan and a card with no tachometer looked exactly alike. The same
             # line stood in the Intel reader; both are fixed, both are covered by a test.
             d["fan_rpm"] = read_int(f"{self.hw}/fan1_input", None)
-            _pwm = read_int(f"{self.hw}/pwm1", -1)      # 0–255 duty cycle → percent
-            d["fan_pct"] = round(_pwm * 100 / 255) if _pwm >= 0 else None
+            # The percentage beside the rpm is the share of the fan's top speed, the same
+            # thing the rpm measures. pwm1 is the duty cycle the SMU commands, a different
+            # quantity: on an R9700 it ran 1 to 3 points above rpm/fan1_max and the gap grew
+            # with speed (38.8 % duty at 35.5 % of 5100 rpm), because fan speed is not linear
+            # in duty. Duty remains the answer only where no top speed is declared.
+            if d["fan_rpm"] is not None and self.fan_max > 0:
+                d["fan_pct"] = round(d["fan_rpm"] * 100 / self.fan_max)
+            else:
+                _pwm = read_int(f"{self.hw}/pwm1", -1)      # 0–255 duty cycle → percent
+                d["fan_pct"] = round(_pwm * 100 / 255) if _pwm >= 0 else None
         d.update(_amd_gpu_metrics(self.card))
         if d.get("mem_clock"):
             d["mclk"] = d["mem_clock"]
@@ -894,6 +952,7 @@ def discover_gpus():
     monitor for each driver. NVIDIA cards are correlated to nvidia-smi by index."""
     gpus, feeds = [], {}
     intel_vram = None
+    amd_power = None
     nvidia_feed = None
     nvidia_seen = 0
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
@@ -910,7 +969,13 @@ def discover_gpus():
         idx = int(re.search(r"card(\d+)", card).group(1))
         g = None
         if driver == "amdgpu":
-            g = AmdGpu(card, name)
+            if amd_power is None:
+                amd_power = _AmdPowerFeed([])
+                feeds["amdpower"] = amd_power
+            g = AmdGpu(card, name, amd_power)
+            if g.hw:
+                amd_power.hwmons.append(g.hw)
+                amd_power._acc[g.hw] = [0.0, 0]
         elif driver in ("i915", "xe"):
             if intel_vram is None:
                 intel_vram = _NvtopVramFeed()
@@ -2565,7 +2630,7 @@ def probe():
                 if s.get("vram_total") else "—")
         print(f"\n[{s['vendor']}] {s['name']}")
         print(f"   util={s.get('util')}%  vram={vram}  temp={s.get('temp_main')}C"
-              f"  power={s.get('power')}W/{s.get('power_cap')}  "
+              f"  power={_n(s.get('power'), 1)}W/{s.get('power_cap')}  "
               f"clk={s.get('sclk')}/{s.get('mclk')}MHz")
         if s.get("throttle"):
             print(f"   throttling: {', '.join(s['throttle'])}")
