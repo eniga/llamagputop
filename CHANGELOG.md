@@ -13,6 +13,10 @@ belonging to either, so its date is the repository's first day rather than a rel
 
 ## Unreleased
 
+### Added
+
+* The memory voltage regulator's temperature on AMD cards. `gpu_metrics` v1_3 carries three regulator temperatures side by side, and only the graphics and SoC ones were read; the third, `temperature_vrmem` at offset 14, now appears as "vrm mem" beside them. hwmon does not publish it, so it was visible only in amdgpu_top. On two Radeon AI PRO R9700s it read 34 to 35 °C idle and 56 to 64 °C under sustained decode, matching amdgpu_top's decode of the same blob.
+
 ### Fixed
 
 * The dashboard and the terminal view reported different PCIe links for the same card. The terminal view took the chain's root port and the dashboard took the card's own node, and on a Radeon AI PRO R9700 the card's node describes the hop to the switch on the card itself: 32 GT/s x16 while the slot ran x8. Both now report the root port, the link the chain's own docstring already called the only stable value.

@@ -295,8 +295,14 @@ def _amd_gpu_metrics(card):
         # not a coincidence. The real core voltage comes from hwmon in0_input, which this
         # file already reads. The blob's own voltage fields sit at 104, 106 and 108
         # (soc, gfx, mem; 96 is the u64 firmware_timestamp) and are not decoded here.
+        # Offset 14 is the third of the set, temperature_vrmem, the regulator feeding the
+        # memory. hwmon does not publish it, so without this read it appeared nowhere but
+        # in amdgpu_top. Checked 2026-09-30 on two R9700s (content_rev 3) against
+        # amdgpu_top's decode of the same blob: 34-35 idle, 56-64 under sustained vLLM
+        # decode, climbing with the memory temperature beside it.
         out["vrm_temp_gfx"] = good(u16(10))
         out["vrm_temp_soc"] = good(u16(12))
+        out["vrm_temp_mem"] = good(u16(14))
         # pcie_link_width at 74 is the width the card's own firmware sees on its upstream
         # link. In a VM it is the only place the physical width shows: sysfs has QEMU's
         # emulated values. Checked 2026-09-29 on an R9700 (content_rev 3) passed through on a
@@ -420,7 +426,8 @@ class AmdGpu:
         # panel already iterates `temp` and colours each against its driver-declared limits.
         # hwmon declares no limit for these two, so they fall back to the fixed 80/90 °C,
         # which is the same treatment any unlabelled sensor gets, not a special case.
-        for _k, _lbl in (("vrm_temp_gfx", "vrm gfx"), ("vrm_temp_soc", "vrm soc")):
+        for _k, _lbl in (("vrm_temp_gfx", "vrm gfx"), ("vrm_temp_soc", "vrm soc"),
+                         ("vrm_temp_mem", "vrm mem")):
             if d.get(_k) is not None:
                 d.setdefault("temp", {})[_lbl] = d[_k]
         d["pcie"] = pcie_chain(self.dev)

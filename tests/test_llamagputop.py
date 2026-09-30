@@ -1078,6 +1078,34 @@ class AmdFirmwareLinkWidth(Base):
         self.assertNotIn("pcie_fw_width", self.blob(1, 8))
 
 
+class AmdVrmTemperatures(Base):
+    """gpu_metrics v1_3 temperature_vrgfx/vrsoc/vrmem, offsets 10, 12 and 14."""
+
+    def card_with(self, vrgfx, vrsoc, vrmem):
+        import struct
+        d = bytearray(120)
+        struct.pack_into("<HBB", d, 0, 120, 1, 3)
+        struct.pack_into("<HHH", d, 10, vrgfx, vrsoc, vrmem)
+        struct.pack_into("<Q", d, 112, 0)
+        card = self.card(f"v{vrgfx}-{vrsoc}-{vrmem}", dev={},
+                         hwmon={"temp1_label": "edge", "temp1_input": 50000})
+        with open(os.path.join(card, "device", "gpu_metrics"), "wb") as f:
+            f.write(bytes(d))
+        return lgt.AmdGpu(card, "Fixture").sample()
+
+    def test_all_three_regulators_join_the_temperatures(self):
+        t = self.card_with(56, 57, 58)["temp"]
+        self.assertEqual((t["vrm gfx"], t["vrm soc"], t["vrm mem"]), (56, 57, 58))
+
+    def test_the_memory_regulator_is_its_own_field(self):
+        self.assertEqual(self.card_with(56, 57, 58)["vrm_temp_mem"], 58)
+
+    def test_an_unsupported_marker_is_not_a_temperature(self):
+        s = self.card_with(56, 57, 0xFFFF)
+        self.assertIsNone(s["vrm_temp_mem"])
+        self.assertNotIn("vrm mem", s["temp"])
+
+
 class AmdHeadlineSensor(Base):
     """The headline temperature says which sensor it is."""
 
