@@ -821,7 +821,9 @@ const SRV_SHOWN = ['port','pid','flavor','alive','stale','phase','model','pp','t
   'kv_used','kv_cap','metrics_off','slots_off','multi','pp_life','tg_life',
   'kv_pool','preemptions','ttft_n','reuse',
   'run','prun','reuse_recent','ingest','ttft_avg','tpot_avg','e2e_avg','prompt_avg',
-  'answer_avg','gen_total','prompt_total','req_total'];
+  'answer_avg','gen_total','prompt_total','req_total',
+  'spec_pos','tok_step','step_ms','engine_version','uptime_s','experts','link','kv_held',
+  'linear_reuse','prefix_evictions','rows_unspec'];
 
 function srvLive(d){
   const state = !d.alive ? 'off' : d.stale ? 'busy'
@@ -887,6 +889,29 @@ const ago = t => {
 const runDur = s => s === null || s === undefined ? '—' : s < 60 ? `${Math.round(s)} s`
   : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 
+// radiance: the same run-shaped panel as vLLM (it exports vLLM's request histograms), plus
+// what only that engine has. Prefill IS live there, so its line says so.
+const upt = s => s == null ? '—' : s < 3600 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
+function radianceRows(d){
+  const ex = d.experts || {}, lk = d.link || {};
+  const gib = b => b == null ? '—' : (b / 1073741824).toFixed(1) + ' GiB';
+  const tiers = ex.tiers ? Object.entries(ex.tiers).filter(([, b]) => b).map(([k, b]) => `${E(k)} ${gib(b)}`).join(' · ') : '';
+  return `
+    <div class="g">radiance engine</div>
+    ${row('version · uptime', `${E(d.engine_version || '—')} · ${upt(d.uptime_s)}`)}
+    ${row('decode step', d.step_ms == null ? '—' : `<b>${n(d.step_ms, 1)}</b> ms`)}
+    ${row('tokens / step', d.tok_step == null ? '—' : `<b>${n(d.tok_step, 2)}</b>${
+        d.spec_pos && d.spec_pos.length ? ` <span class="dim">· per position ${d.spec_pos.map(v => n(v * 100, 0) + '%').join(' ')}</span>` : ''}`)}
+    ${row('experts in VRAM', ex.resident_hit == null ? '—'
+        : `<b class="${ex.resident_hit >= 0.85 ? 'ok' : 'warn'}">${n(ex.resident_hit * 100, 1)}%</b> of routed · ${nk(ex.promotions)} promoted · ${nk(ex.demotions)} demoted`)}
+    ${tiers ? row('expert tiers', tiers) : ''}
+    ${row('PCIe link', lk.h2d_gbs == null ? '—'
+        : `${n(lk.h2d_gbs, 2)} GB/s h2d · ${n(lk.d2h_gbs, 2)} d2h · ${nk(lk.ar_per_s)} all-reduce/s`)}
+    ${row('KV held for next turn', d.kv_held == null ? '—' : nk(d.kv_held) + ' tok')}
+    ${row('linear-state reuse', d.linear_reuse == null ? '—' : n(d.linear_reuse * 100, 1) + '%')}
+    ${d.prefix_evictions ? row('prefix evictions', `<span class="warn">${nk(d.prefix_evictions)}</span>`) : ''}`;
+}
+
 function srvVllm(d){
   const state = !d.alive ? 'off' : d.stale ? 'busy'
     : (d.phase === 'generating' || d.phase === 'prefill') ? 'busy' : 'on';
@@ -904,9 +929,13 @@ function srvVllm(d){
       `${nk(p.p_tok)} tok in ${n(p.p_time, 1)} s${liveTag(p)}`;
   const kvTxt = d.kv_used && d.kv_cap ? ` · ${nk(d.kv_used)} / ${nk(d.kv_cap)} tokens` : '';
   const genNow = d.tg !== null && d.tg !== undefined ? n(d.tg, 1) : '0.0';
-  const ppLast = d.pp_last !== null && d.pp_last !== undefined ? nk(d.pp_last) : '—';
+  const rad = d.flavor === 'radiance';
+  const ppLast = rad && d.pp != null ? nk(d.pp)
+    : d.pp_last !== null && d.pp_last !== undefined ? nk(d.pp_last) : '—';
+  const ppWhat = rad ? (d.pp != null ? 'tok/s prefill, live' : 'tok/s prefill, last seen')
+    : 'tok/s prefill, last completed request';
   return `
-    <h3>vLLM :${E(d.port)} ${pill}</h3>
+    <h3>${E(d.flavor || 'vLLM')} :${E(d.port)} ${pill}</h3>
     <div class="sub">${E(d.model || 'no model loaded')}${d.pid ? ' · pid ' + E(d.pid) : ''}${
       d.ctx ? ' · ctx ' + nk(d.ctx) : ''}</div>
     <div class="lbl"><span>KV cache</span><b>${n(d.kv_pct, 2)}%${kvTxt}</b></div>
@@ -914,7 +943,7 @@ function srvVllm(d){
     <div class="big">${genNow} <span>tok/s generated</span></div>
     ${d.tg_series && d.tg_series.length > 1 ? spark(d.tg_series, 'var(--ok)') : ''}
     ${row('decode ' + (r && r.live ? 'this run' : 'last run'), decode)}
-    <div class="big">${ppLast} <span>tok/s prefill, last completed request</span></div>
+    <div class="big">${ppLast} <span>${ppWhat}</span></div>
     ${d.pp_series && d.pp_series.length > 1 ? spark(d.pp_series, 'var(--accent)') : ''}
     ${row('prefill ' + (p && p.live ? 'this run' : 'last run'), prefill)}
     ${row('cache reuse', rr ? `<b class="ok">${n(rr.frac * 100, 1)}%</b> of ${nk(rr.tokens)} prompt tokens · ${ago(rr.at)}`
@@ -932,11 +961,12 @@ function srvVllm(d){
     ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
     ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
     ${d.kv_series && d.kv_series.length > 1
-      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
+      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}
+    ${rad ? radianceRows(d) : ''}`;
 }
 
 function procTable(ps){
-  if (!ps || !ps.length) return '<div class="empty">No llama.cpp or vLLM processes detected.</div>';
+  if (!ps || !ps.length) return '<div class="empty">No llama.cpp, vLLM or radiance processes detected.</div>';
   return `<div class="card"><div class="wrap"><table>
     <tr><th>pid</th><th>name</th><th>model</th><th>RSS MiB</th><th>VRAM MiB</th>
         <th>GTT</th><th>GPU</th><th>source</th><th>note</th></tr>` +
@@ -1043,7 +1073,7 @@ function render(s){
   mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
   mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
   mount('g-sys', 'pwr', powerLive(s), '', seen);
-  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, d.flavor === 'vLLM' ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
+  (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, (d.flavor === 'vLLM' || d.flavor === 'radiance') ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
   prune(seen);
 
   paint($('g-proc'), procTable(s.procs));

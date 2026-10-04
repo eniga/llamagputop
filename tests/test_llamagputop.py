@@ -1,3 +1,4 @@
+import json
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Tests for llamagputop.
@@ -1161,6 +1162,187 @@ class AmdHeadlineSensor(Base):
     def test_edge_is_named_when_it_is_the_only_sensor(self):
         card = self.card("e", dev={}, hwmon={"temp1_label": "edge", "temp1_input": 66000})
         self.assertEqual(lgt.AmdGpu(card, "Fixture").sample()["temp_main_label"], "edge")
+
+
+def radiance_metrics(running=0, dec=0, steps=0, step_s=0.0, ptps=0.0, dtok=0, dacc=0,
+                     pos=(), gen=0, kv=0.0):
+    L = 'model_name="Qwen3.8-Flash-Next",engine="0"'
+    out = [f"vllm:num_requests_running{{{L}}} {running}",
+           f"vllm:num_requests_waiting{{{L}}} 0",
+           f"vllm:kv_cache_usage_perc{{{L}}} {kv}",
+           f"vllm:generation_tokens_total{{{L}}} {gen}",
+           f"vllm:gpu_prefix_cache_hit_rate{{{L}}} 0.25",
+           f"radiance:decode_tokens_total{{{L}}} {dec}",
+           f"radiance:engine_steps_decode_total{{{L}}} {steps}",
+           f"radiance:engine_step_seconds_decode_total{{{L}}} {step_s}",
+           f"radiance:prefill_tokens_per_second{{{L}}} {ptps}",
+           f"radiance:draft_tokens_total{{{L}}} {dtok}",
+           f"radiance:draft_accepted_total{{{L}}} {dacc}",
+           f"radiance:linear_prefix_cache_hit_rate{{{L}}} 0.5"]
+    out += [f'radiance:draft_position_acceptance_ratio{{{L},position="{i}"}} {v}'
+            for i, v in enumerate(pos)]
+    return "\n".join(out) + "\n"
+
+
+RADIANCE_STATS = json.dumps({
+    "version": "1.0.6", "uptime_s": 290, "kv_tokens_total": 486464, "kv_tokens_used": 48646,
+    "kv_tokens_cached": 1200,
+    "experts": {"routed": 1000, "routed_res": 960, "promotions": 12, "demotions": 3,
+                "tiers": [{"name": "vram", "bytes": 27299543040}, {"name": "pinned", "bytes": 4479298560}]},
+    "link": {"world": 2, "ar_calls": 100, "h2d_bytes": 0, "d2h_bytes": 0}})
+
+
+class RadianceCommandLine(Base):
+    """What a radiance command line says, read without a process running."""
+
+    CMD = ["radiance", "--model", "/models/qwen3.8-next-flash-fp8-iq4r-moe.rad", "--host", "::",
+           "--port", "8080", "--api-key", "secret123", "--tp", "2", "--tp-wire", "wht6",
+           "--max-num-seqs", "8", "--max-model-len", "200000", "--placement", "expert_tiered",
+           "--num-speculative-tokens", "3", "--served-model-name", "Qwen3.8-Flash-Next",
+           "--reasoning-effort", "xhigh"]
+
+    def test_port_host_and_served_name(self):
+        srv = lgt.radiance_from_cmd(self.CMD, 7)
+        self.assertEqual((srv["port"], srv["host"], srv["model_hint"], srv["kind"], srv["flavor"]),
+                         ("8080", "127.0.0.1", "Qwen3.8-Flash-Next", "radiance", "radiance"))
+
+    def test_container_name_without_served_name(self):
+        srv = lgt.radiance_from_cmd(["radiance", "--model", "/m/flash.rad"])
+        self.assertEqual((srv["port"], srv["model_hint"]), ("8000", "flash"))
+
+    def test_the_container_init_wrapper_is_not_the_server(self):
+        self.assertTrue(lgt._is_radiance("radiance", self.CMD))
+        self.assertFalse(lgt._is_radiance("docker-init", ["/sbin/docker-init", "--"] + self.CMD))
+
+    def test_speculation_depth_off_and_auto(self):
+        self.assertEqual(lgt.radiance_spec_from_cmd(self.CMD), ("mtp", "in container", "3"))
+        self.assertEqual(lgt.radiance_spec_from_cmd(["radiance", "--model", "m"]),
+                         ("mtp", "in container", "auto"))
+        self.assertEqual(lgt.radiance_spec_from_cmd(["radiance", "--num-speculative-tokens", "0"]),
+                         (None, None, None))
+
+    def test_config_panel_groups_and_masks(self):
+        cfg = dict((g, dict(rows)) for g, rows in
+                   lgt.settings_from_cmd(self.CMD, lgt._RADIANCE_FLAG_GROUPS).items())
+        self.assertEqual(cfg["parallel"]["wire"], "wht6")
+        self.assertEqual(cfg["memory"]["placement"], "expert_tiered")
+        self.assertEqual(cfg["sampling"]["reasoning"], "xhigh")
+        self.assertNotIn("secret123", cfg["server"]["api-key"])
+        self.assertNotIn("other", cfg)
+
+    def test_expected_tokens_per_step(self):
+        # 1 + 0.7 + 0.7*0.6 + 0.7*0.6*0.5
+        self.assertAlmostEqual(lgt.RadianceProbe._tokens_per_step([0.7, 0.6, 0.5]), 2.33)
+        self.assertEqual(lgt.RadianceProbe._tokens_per_step([]), 1.0)
+
+
+class RadianceProbeRates(Base):
+    """The probe against a scripted /metrics + /stats sequence and a fake clock."""
+
+    def setUp(self):
+        super().setUp()
+        self._time = lgt.time
+        self.clock = FakeClock()
+        lgt.time = self.clock
+        self.pr = lgt.RadianceProbe("8080")
+        self.pr._cmdline = lambda: RadianceCommandLine.CMD
+        self.pr._STATS_TTL = 0.0
+        self.body = ""
+        self.paths = []
+
+        def get(path, timeout=2.5):
+            self.paths.append(path)
+            if path == "/v1/models":
+                return '{"data":[{"id":"Qwen3.8-Flash-Next"}]}'
+            if path == "/stats":
+                return RADIANCE_STATS
+            return self.body
+        self.pr._get = get
+
+    def tearDown(self):
+        lgt.time = self._time
+        super().tearDown()
+
+    def tick(self, dt=1.0, **kw):
+        self.clock.t += dt
+        self.body = radiance_metrics(**kw)
+        return self.pr.sample()
+
+    def test_live_rate_is_the_engine_decode_counter_not_the_vllm_one(self):
+        # vllm:generation_tokens_total stays flat until the request ends, as measured
+        self.tick(running=0, dec=100, steps=10, step_s=0.2)
+        self.tick(running=1, dec=100, steps=10, step_s=0.2, ptps=6900)      # prefill
+        g1 = self.tick(running=1, dec=240, steps=60, step_s=1.0)
+        g2 = self.tick(running=1, dec=380, steps=110, step_s=1.8)
+        self.assertEqual(g2["phase"], "generating")
+        self.assertAlmostEqual(g2["tg"], 140.0)
+
+    def test_prefill_is_live_only_while_prefilling(self):
+        self.tick(running=0, dec=100)
+        pre = self.tick(running=1, dec=100, ptps=6955.0)
+        self.assertEqual(pre["phase"], "prefill")
+        self.assertAlmostEqual(pre["pp"], 6955.0)
+        # the gauge decays for seconds after the work stops: idle must not read it as live
+        idle = self.tick(running=0, dec=150, ptps=719.0)
+        self.assertIsNone(idle["pp"])
+        self.assertAlmostEqual(idle["pp_last"], 6955.0)
+
+    def test_step_time_is_decode_seconds_over_decode_steps(self):
+        self.tick(running=1, dec=100, steps=100, step_s=1.5)
+        s = self.tick(running=1, dec=200, steps=150, step_s=2.4)
+        self.assertAlmostEqual(s["step_ms"], 18.0)
+
+    def test_speculation_from_the_engine_counters(self):
+        s = self.tick(dtok=300, dacc=150, pos=(0.7, 0.6, 0.5))
+        self.assertAlmostEqual(s["spec"], 0.5)
+        self.assertEqual(s["spec_pos"], [0.7, 0.6, 0.5])
+        self.assertAlmostEqual(s["tok_step"], 2.33)
+        self.assertEqual((s["spec_type"], s["spec_nmax"]), ("mtp", "3"))
+
+    def test_stats_fill_pool_held_kv_and_the_expert_plane(self):
+        s = self.tick()
+        self.assertEqual((s["kv_pool"], s["kv_used"], s["kv_held"]), (486464, 48646, 1200))
+        self.assertAlmostEqual(s["kv"], 48646 / 486464)
+        self.assertAlmostEqual(s["experts"]["resident_hit"], 0.96)
+        self.assertEqual(s["experts"]["tiers"]["vram"], 27299543040)
+        self.assertEqual((s["engine_version"], s["uptime_s"]), ("1.0.6", 290))
+
+    def test_context_and_reasoning_come_from_the_command_line(self):
+        s = self.tick()
+        self.assertEqual((s["model"], s["ctx"], s["slots"]), ("Qwen3.8-Flash-Next", 200000, 8))
+        self.assertEqual(s["reasoning_format"], "effort xhigh")
+
+    def test_reuse_rates_are_the_published_gauges(self):
+        s = self.tick()
+        self.assertAlmostEqual(s["reuse"], 0.25)
+        self.assertAlmostEqual(s["linear_reuse"], 0.5)
+
+    # ---- the pairs: absent stays absent, zero stays zero
+    def test_no_drafting_yet_is_not_zero_acceptance(self):
+        s = self.tick(dtok=0, dacc=0)
+        self.assertIsNone(s["spec"])
+        self.assertIsNone(s["tok_step"])
+
+    def test_an_auth_failure_reads_as_metrics_off_not_as_zeros(self):
+        self.clock.t += 1
+        self.body = '{"error":{"message":"invalid api key"}}'
+        s = self.pr.sample()
+        self.assertTrue(s["metrics_off"])
+        self.assertIsNone(s["tg"])
+
+    def test_fleet_builds_a_radiance_probe_for_a_radiance_server(self):
+        srv = lgt.radiance_from_cmd(RadianceCommandLine.CMD, 7)
+        saved = (lgt.discover_llama_servers, lgt.RadianceProbe.sample, dict(lgt._probes))
+        try:
+            lgt._probes.clear()
+            lgt.discover_llama_servers = lambda: [srv]
+            lgt.RadianceProbe.sample = lambda self: {"alive": True}
+            out = lgt.sample_llama_fleet()
+            self.assertIs(type(lgt._probes["8080"]), lgt.RadianceProbe)
+            self.assertEqual((out[0]["flavor"], out[0]["port"]), ("radiance", "8080"))
+        finally:
+            lgt.discover_llama_servers, lgt.RadianceProbe.sample = saved[0], saved[1]
+            lgt._probes.clear(); lgt._probes.update(saved[2])
 
 
 if __name__ == "__main__":
