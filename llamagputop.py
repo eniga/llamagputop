@@ -1199,7 +1199,7 @@ def discover_llama_servers():
         flavor = "llama.cpp" if executable == "llama-server" else executable
         out.append({"pid": os.path.basename(p), "port": port,
                     "host": _host_of(cmd), "model_hint": model, "flavor": flavor})
-    for srv in discover_vllm_servers():
+    for srv in discover_vllm_servers() + discover_radiance_servers():
         if srv["port"] not in seen:
             seen.add(srv["port"])
             out.append(srv)
@@ -1270,6 +1270,70 @@ def discover_vllm_servers():
             out.append({"pid": "?", "port": port, "host": host or "127.0.0.1",
                         "flavor": "vLLM", "kind": "vllm", "model_hint": ""})
     return out
+
+
+# ------------------------------------------------------------ radiance server probe
+def _is_radiance(comm, cmd):
+    """The radiance server process. In a container the host's process list also carries
+    the init wrapper (`docker-init -- radiance --model ...`), whose command line looks
+    the same but whose name is not `radiance`, so the name decides."""
+    return comm == "radiance" and "--model" in cmd
+
+
+def radiance_from_cmd(cmd, pid="?"):
+    """Server entry for a radiance command line. radiance's default port is 8000 like
+    vLLM's; `--host ::` is how the published compose files bind both stacks, and is
+    probed on loopback. The model is a .rad container path unless --served-model-name
+    renames it, which is what /v1/models and the metrics then report."""
+    flags = dict(_parse_cmdline_flags(cmd))
+    port = str(flags.get("--port") or "8000")
+    host = flags.get("--host")
+    host = "127.0.0.1" if (not isinstance(host, str) or host in ("0.0.0.0", "::", "[::]")) else host
+    model = flags.get("--served-model-name") or flags.get("--model")
+    model = os.path.basename(model.rstrip("/")).replace(".rad", "") if isinstance(model, str) else ""
+    return {"pid": str(pid), "port": port, "host": host, "flavor": "radiance",
+            "kind": "radiance", "model_hint": model}
+
+
+def _radiance_procs():
+    for p in glob.glob("/proc/[0-9]*"):
+        comm = read(f"{p}/comm", "") or ""
+        if comm != "radiance":
+            continue
+        cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
+        if _is_radiance(comm, cmd):
+            yield os.path.basename(p), cmd
+
+
+def discover_radiance_servers():
+    """Every radiance server, from the process list. Its port is the one it binds, which
+    is the host's own port under host networking, the way its compose files run it."""
+    out, seen = [], set()
+    for pid, cmd in _radiance_procs():
+        srv = radiance_from_cmd(cmd, pid)
+        if srv["port"] not in seen:
+            seen.add(srv["port"])
+            out.append(srv)
+    return out
+
+
+def _radiance_cmd_for_port(port):
+    for _pid, cmd in _radiance_procs():
+        if radiance_from_cmd(cmd)["port"] == str(port):
+            return cmd
+    return None
+
+
+def radiance_spec_from_cmd(cmd):
+    """(method, head, depth) of radiance's speculative decoding. The drafter is merged
+    into the container at convert time (--draft-model is not implemented), so the head is
+    always the container's own; --num-speculative-tokens 0 turns it off, and leaving it
+    unset is `auto`, the drafter's own operating point."""
+    flags = dict(_parse_cmdline_flags(cmd or []))
+    n = flags.get("--num-speculative-tokens")
+    if isinstance(n, str) and n.strip() == "0":
+        return None, None, None
+    return "mtp", "in container", (n if isinstance(n, str) else "auto")
 
 
 def _vllm_cmd_for_port(port):
@@ -1575,14 +1639,14 @@ _API_KEY_TTL = 30.0
 
 
 def _cmd_for_port(port):
-    """The argv of the llama-server or vLLM server listening on `port`, or None."""
+    """The argv of the llama-server, vLLM or radiance server listening on `port`, or None."""
     for p in glob.glob("/proc/[0-9]*"):
         if (read(f"{p}/comm", "") or "") != "llama-server":
             continue
         cmd = [c for c in (read(f"{p}/cmdline", "") or "").split("\x00") if c]
         if cmd and _port_of(cmd) == str(port):
             return cmd
-    return _vllm_cmd_for_port(port)
+    return _vllm_cmd_for_port(port) or _radiance_cmd_for_port(port)
 
 
 def api_key_for(port):
@@ -1654,6 +1718,9 @@ def llama_settings_from_cmdline(port=None):
         cmd = _vllm_cmd_for_port(port)
         if cmd:
             return vllm_settings_from_cmd(cmd)
+        cmd = _radiance_cmd_for_port(port)
+        if cmd:
+            return settings_from_cmd(cmd, _RADIANCE_FLAG_GROUPS)
     return None
 
 
@@ -1699,6 +1766,50 @@ _VLLM_FLAG_GROUPS = (
     ("server", (
         ("host", ("--host",)), ("port", ("--port",)),
         ("api-key", ("--api-key",)),
+    )),
+)
+
+
+# radiance's flags, same rule: an ordering, not a filter. Its pools are budgeted
+# explicitly (the engine never re-optimises them quietly), so the memory group is the one
+# to read when a number moves.
+_RADIANCE_FLAG_GROUPS = (
+    ("loading", (
+        ("model", ("--model",)), ("served-as", ("--served-model-name",)),
+        ("context", ("--max-model-len",)), ("kv-dtype", ("--kv-cache-dtype",)),
+        ("vision", ("--mm-max-patches",)), ("template", ("--override-chat-template",)),
+    )),
+    ("parallel", (
+        ("tp", ("--tp",)), ("wire", ("--tp-wire",)), ("wire-min", ("--tp-wire-min-kb",)),
+        ("kernels", ("--kernels",)),
+    )),
+    ("memory", (
+        ("placement", ("--placement",)), ("expert/cache", ("--expert-vs-cache-ratio",)),
+        ("host-pool", ("--host-pool-mib",)), ("headroom", ("--gpu-headroom-mib",)),
+        ("vram-weights", ("--vram-weights-mib",)), ("vram-kv", ("--vram-kv-mib",)),
+        ("disk-tier", ("--weights-disk-tier",)), ("pinned", ("--deterministic",)),
+    )),
+    ("scheduling", (
+        ("max-seqs", ("--max-num-seqs",)), ("max-batched", ("--max-num-batched-tokens",)),
+        ("queue", ("--max-queued-requests",)),
+    )),
+    ("prefix cache", (
+        ("host", ("--prefix-cache-host-mib",)), ("disk", ("--prefix-cache-disk-mib",)),
+        ("dir", ("--prefix-cache-dir",)), ("off", ("--no-prefix-cache",)),
+        ("ckpt-every", ("--checkpoint-interval",)), ("ckpt-slots", ("--checkpoint-slots",)),
+        ("ckpt-policy", ("--checkpoint-policy",)),
+    )),
+    ("speculative", (
+        ("depth", ("--num-speculative-tokens",)),
+    )),
+    ("sampling", (
+        ("reasoning", ("--reasoning-effort",)), ("temp", ("--temp",)), ("top-k", ("--top-k",)),
+        ("top-p", ("--top-p",)), ("min-p", ("--min-p",)),
+        ("presence", ("--presence-penalty",)), ("repetition", ("--repetition-penalty",)),
+        ("max-tokens", ("--default-max-tokens",)), ("template-kwargs", ("--chat-template-kwargs",)),
+    )),
+    ("server", (
+        ("host", ("--host",)), ("port", ("--port",)), ("api-key", ("--api-key",)),
     )),
 )
 
@@ -1800,7 +1911,7 @@ def llama_processes():
         name = read(f"{p}/comm", "") or ""
         # vLLM is several processes: the `vllm` API server, `VLLM::EngineCore`, and one
         # `VLLM::Worker_TPn` per GPU, and it is the workers that hold the VRAM
-        if not (name.startswith("llama-") or name == "vllm" or name.startswith("VLLM::")):
+        if not (name.startswith("llama-") or name in ("vllm", "radiance") or name.startswith("VLLM::")):
             continue
         v = {"pid": os.path.basename(p), "name": name, "rss": 0, "model": "",
              "vram": 0, "gtt": 0, "read": False, "caps": [], "error": None, "gpu_accel": False,
@@ -1817,6 +1928,8 @@ def llama_processes():
         cmd = (read(f"{p}/cmdline", "") or "").split("\x00")
         if name == "vllm":
             v["model"] = vllm_from_cmd([c for c in cmd if c])["model_hint"]
+        elif name == "radiance":
+            v["model"] = radiance_from_cmd([c for c in cmd if c])["model_hint"]
         elif "-m" in cmd:
             try:
                 v["model"] = os.path.basename(cmd[cmd.index("-m") + 1]).replace(".gguf", "")
@@ -2280,9 +2393,14 @@ class VllmProbe(LlamaProbe):
     data-parallel deployment reads as one server."""
 
     _CMD_TTL = 30.0
+    # The counter whose slope is the live generation rate. vLLM's advances every engine
+    # step; an engine whose compatibility counter only moves when a request finishes
+    # names its own per-step counter here (RadianceProbe).
+    _GEN_COUNTER = "vllm:generation_tokens_total"
 
     def __init__(self, port="8000", host="127.0.0.1"):
         super().__init__(port, host)
+        self._m = {}                       # this tick's parsed /metrics, for subclasses
         self.hc = {}                       # previous tick's counter/histogram totals
         self._glast = None                 # generation_tokens_total last tick
         self.pool = None                   # KV pool size in tokens (cache_config_info)
@@ -2345,7 +2463,7 @@ class VllmProbe(LlamaProbe):
             return d
         self._fails = 0
         d["alive"] = True
-        m = prom_parse(raw)
+        m = self._m = prom_parse(raw)
 
         def tot(name):
             rows = m.get(name)
@@ -2458,7 +2576,7 @@ class VllmProbe(LlamaProbe):
         if c[K[6]] and c[K[4]] is not None and c[K[5]] is not None:
             d["tg_life"] = (c[K[4]] - c[K[5]]) / c[K[6]]
         # ---- live generation rate and phase
-        gen = tot("vllm:generation_tokens_total") or 0.0
+        gen = tot(self._GEN_COUNTER) or 0.0
         busy = running > 0
         advanced = self._glast is not None and gen > self._glast
         if busy:
@@ -2542,6 +2660,173 @@ class VllmProbe(LlamaProbe):
         return d
 
 
+class RadianceProbe(VllmProbe):
+    """Reads Deadcode's radiance engine. It exports vLLM's metric names as a compatibility
+    set, so everything VllmProbe computes applies, plus a `radiance:` family and /stats with
+    what only this engine has. Measured on 1.0.6 (TP=2, Flash-Next) by scraping every 0.5 s:
+
+    * vllm:generation_tokens_total moves only when a request FINISHES (59 -> 114 at the
+      end of a 55-token answer), so its slope is no live rate. radiance:decode_tokens_total
+      advances every step (+60 to +80 per 0.5 s at ~140 tok/s) and is used instead.
+    * Prefill IS observable live: radiance:prefill_tokens_per_second read ~6,950 tok/s in
+      the middle of a 15K-token prefill. It is an engine-side moving average that decays
+      for seconds after the work stops (2,069 -> 719 -> 264 ... with nothing running), so
+      it is believed only while a request is in prefill, and kept as `last` afterwards.
+    * /metrics and /stats need the API key, unlike vLLM's /metrics; the key comes from the
+      command line like every other server's.
+    * /v1/models carries no max_model_len, so the context is --max-model-len.
+
+    The engine-only figures: the decode step time from the step-seconds and step counters
+    (wall-clock over steps would charge idle and prefill to it, the docs' own warning), the
+    expected tokens per drafting step from the per-position acceptance (the headline
+    acceptance ratio is conditional on having drafted and can read healthy while
+    tokens-per-step collapses), and from /stats the expert plane, the PCIe traffic, the
+    KV held for the next turn, the version and the uptime."""
+
+    _GEN_COUNTER = "radiance:decode_tokens_total"
+    _STATS_TTL = 2.0
+
+    def __init__(self, port="8000", host="127.0.0.1"):
+        super().__init__(port, host)
+        self.stats = {}
+        self._stats_at = None
+        self._step = None                  # (step seconds, steps) at the last tick
+        self.step_ms = None
+        self._link = None                  # (h2d bytes, d2h bytes, ar calls, monotonic)
+        self.link = None
+
+    def _blank(self):
+        d = super()._blank()
+        d.update(step_ms=self.step_ms, engine_version=None, uptime_s=None, experts=None,
+                 link=self.link, kv_held=None, linear_reuse=None, prefix_evictions=None,
+                 rows_unspec=None)
+        return d
+
+    def _cmdline(self):
+        if self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL:
+            self._cmd = _radiance_cmd_for_port(self.port) or []
+            self._cmd_at = time.monotonic()
+        return self._cmd
+
+    @staticmethod
+    def _tokens_per_step(rates):
+        """Expected tokens a drafting row emits per step: the bonus token plus each draft
+        position, reached only if every earlier one was accepted. `rates` are the
+        per-position acceptance ratios, each conditional on its position being reached."""
+        exp, reach = 1.0, 1.0
+        for r in rates:
+            reach *= r
+            exp += reach
+        return exp
+
+    def _stats(self, now):
+        if self._stats_at is not None and now - self._stats_at < self._STATS_TTL:
+            return self.stats
+        self._stats_at = now
+        try:
+            js = json.loads(self._get("/stats"))
+            if isinstance(js, dict) and "error" not in js:
+                self.stats = js
+        except Exception:
+            pass
+        return self.stats
+
+    def sample(self):
+        d = super().sample()
+        if not d.get("alive") or d.get("stale") or d.get("metrics_off"):
+            return d
+        m = self._m
+        now = time.monotonic()
+
+        def tot(name):
+            rows = m.get(name)
+            return sum(v for _, v in rows) if rows else None
+
+        # ---- live prefill: the engine's gauge, believed only during a prefill
+        ptps = tot("radiance:prefill_tokens_per_second")
+        if d.get("phase") == "prefill" and ptps:
+            self.pp = self.pp_last = ptps
+        else:
+            self.pp = None
+        d["pp"], d["pp_last"] = self.pp, self.pp_last
+        # ---- speculative decoding from the engine's own counters
+        dt, da = tot("radiance:draft_tokens_total"), tot("radiance:draft_accepted_total")
+        if dt:
+            d["spec_draft"], d["spec_acc"] = dt, da or 0
+            d["spec"] = (da or 0) / dt
+        pos = {}
+        for labels, v in m.get("radiance:draft_position_acceptance_ratio") or ():
+            try:
+                pos[int(labels.get("position"))] = v
+            except (TypeError, ValueError):
+                continue
+        if pos and dt:
+            d["spec_pos"] = [pos[i] for i in sorted(pos)]
+            d["tok_step"] = self._tokens_per_step(d["spec_pos"])
+        # ---- decode step time: step seconds over steps, decode steps only
+        ss, sn = tot("radiance:engine_step_seconds_decode_total"), tot("radiance:engine_steps_decode_total")
+        if ss is not None and sn:
+            if self._step and sn > self._step[1] and ss >= self._step[0]:
+                self.step_ms = 1000.0 * (ss - self._step[0]) / (sn - self._step[1])
+            elif self.step_ms is None:
+                self.step_ms = 1000.0 * ss / sn
+            self._step = (ss, sn)
+        d["step_ms"] = self.step_ms
+        # ---- reuse: radiance has no token-level query counter, it publishes the rates
+        if d.get("reuse") is None:
+            d["reuse"] = tot("vllm:gpu_prefix_cache_hit_rate")
+        d["linear_reuse"] = tot("radiance:linear_prefix_cache_hit_rate")
+        d["prefix_evictions"] = tot("radiance:prefix_cache_evictions_total")
+        d["rows_unspec"] = tot("radiance:decode_rows_unspeculated_total")
+        if d.get("preemptions") is None:
+            d["preemptions"] = tot("radiance:num_requests_preempted")
+        # ---- /stats: pool, held KV, version, uptime, expert plane, link
+        st = self._stats(now)
+        if st:
+            pool = st.get("kv_tokens_total")
+            if isinstance(pool, (int, float)) and pool > 0:
+                self.pool = int(pool)
+                d["kv_pool"] = d["kv_cap"] = self.pool
+                used = st.get("kv_tokens_used")
+                if isinstance(used, (int, float)):
+                    d["kv_used"] = int(used)
+                    d["kv"] = used / self.pool
+            d["kv_held"] = st.get("kv_tokens_cached")
+            d["engine_version"] = st.get("version")
+            d["uptime_s"] = st.get("uptime_s")
+            ex = st.get("experts") or {}
+            if ex.get("routed"):
+                d["experts"] = {
+                    "resident_hit": (ex.get("routed_res") or 0) / ex["routed"],
+                    "promotions": ex.get("promotions"), "demotions": ex.get("demotions"),
+                    "tiers": {t.get("name"): t.get("bytes") for t in ex.get("tiers") or ()
+                              if isinstance(t, dict)}}
+            lk = st.get("link") or {}
+            if "h2d_bytes" in lk:
+                cur = (lk.get("h2d_bytes") or 0, lk.get("d2h_bytes") or 0, lk.get("ar_calls") or 0, now)
+                if self._link and cur[0] >= self._link[0] and now > self._link[3]:
+                    span = now - self._link[3]
+                    self.link = {"h2d_gbs": (cur[0] - self._link[0]) / span / 1e9,
+                                 "d2h_gbs": (cur[1] - self._link[1]) / span / 1e9,
+                                 "ar_per_s": (cur[2] - self._link[2]) / span,
+                                 "world": lk.get("world")}
+                self._link = cur
+            d["link"] = self.link
+        # ---- what the command line says (VllmProbe read vLLM's flags here)
+        cmd = self._cmdline()
+        flags = dict(_parse_cmdline_flags(cmd))
+        try:
+            self.ctx = int(flags.get("--max-model-len"))
+        except (TypeError, ValueError):
+            pass
+        d["ctx"] = self.ctx
+        d["spec_type"], d["spec_head"], d["spec_nmax"] = radiance_spec_from_cmd(cmd)
+        re_ = flags.get("--reasoning-effort")
+        d["reasoning_format"] = f"effort {re_}" if isinstance(re_, str) else None
+        self.state = d
+        return d
+
+
 def sample_llama_fleet(explicit_port=None):
     """Sample every running llama-server at once. A probe is kept per port and reused
     between ticks (so its rolling rate survives), created when a server appears and
@@ -2570,7 +2855,7 @@ def sample_llama_fleet(explicit_port=None):
     for srv in servers:
         port = srv["port"]
         active.add(port)
-        cls = VllmProbe if srv.get("kind") == "vllm" else LlamaProbe
+        cls = {"vllm": VllmProbe, "radiance": RadianceProbe}.get(srv.get("kind"), LlamaProbe)
         pr = _probes.get(port)
         if pr is None or type(pr) is not cls:
             pr = _probes[port] = cls(port, srv["host"])
@@ -3536,6 +3821,21 @@ def _llama_rows(d, width):
     if d.get("spec_pos"):
         rows.append([("per pos  ", DIM),
                      (" ".join(f"{v * 100:.0f}%" for v in d["spec_pos"]), 0)])
+    if d.get("flavor") == "radiance":
+        eng = [[("engine   ", DIM), (str(d.get("engine_version") or "?"), OK)]]
+        if d.get("step_ms") is not None:
+            eng.append([("step ", DIM), (f"{d['step_ms']:.1f} ms", 0), (" decode", DIM)])
+        ex = d.get("experts") or {}
+        if ex.get("resident_hit") is not None:
+            eh = ex["resident_hit"]
+            eng.append([("experts ", DIM), (f"{eh * 100:.1f}%", OK if eh >= 0.85 else WARN),
+                        (" in VRAM", DIM)])
+        lk = d.get("link") or {}
+        if lk.get("h2d_gbs") is not None:
+            eng.append([("pcie ", DIM), (f"{lk['h2d_gbs']:.2f}", 0), (" GB/s h2d", DIM)])
+        if d.get("kv_held"):
+            eng.append([("held ", DIM), (f"{_n(d['kv_held'])} tok", 0), (" for next turn", DIM)])
+        rows += _flow(eng, inner)
     w = d.get("power_w") or 0
     _tg = d.get("tg") or 0
     if d.get("phase") == "generating" and _tg > 0 and w > 0:
@@ -3954,6 +4254,7 @@ def main():
         print("Honors NO_COLOR. No dependencies beyond the Python standard library;")
         print("optional helpers used when present: lspci, intel_gpu_top, nvtop, nvidia-smi.")
         print("LLAMAGPUTOP_VLLM=host:port[,...] adds vLLM servers discovery cannot reach.")
+        print("radiance servers are found from the process list like vLLM and llama.cpp.")
         return
     port = next((a for a in argv if a.isdigit()), None)
     gpus, feeds = discover_gpus()

@@ -15,6 +15,8 @@ belonging to either, so its date is the repository's first day rather than a rel
 
 ### Added
 
+* radiance servers (Deadcode's native engine for RDNA4) alongside llama.cpp and vLLM: found from the process list by the `radiance` process (not its `docker-init` wrapper), authenticated with the key on its command line (its `/metrics` and `/stats` require it), and drawn with the vLLM panel because it exports vLLM's metric names. The live generation rate is the slope of `radiance:decode_tokens_total`, measured to advance every step, where the compatibility `vllm:generation_tokens_total` only moves when a request finishes. Prefill is live, from the engine's gauge while a request is in prefill and kept as `last` afterwards, since the gauge decays for seconds once the work stops. Added rows: decode step time, expected tokens per drafting step from the per-position acceptance, experts served from VRAM with promotions/demotions and tier sizes, PCIe traffic, KV held for the next turn, linear-state reuse, version and uptime. Context comes from `--max-model-len`; the configuration panel groups radiance's flags. Sixteen tests.
+
 * The memory voltage regulator's temperature on AMD cards. `gpu_metrics` v1_3 carries three regulator temperatures side by side, and only the graphics and SoC ones were read; the third, `temperature_vrmem` at offset 14, now appears as "vrm mem" beside them. hwmon does not publish it, so it was visible only in amdgpu_top. On two Radeon AI PRO R9700s it read 34 to 35 °C idle and 56 to 64 °C under sustained decode, matching amdgpu_top's decode of the same blob.
 
 ### Fixed
