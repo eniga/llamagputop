@@ -433,6 +433,7 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         "gpus": gpus,
         "cpu": c,
         "mem": m,
+        "disks": san(L._disk.get("last")),
         "llamas": srv,
         "procs": ps,
         "error": None,
@@ -790,6 +791,30 @@ function memLive(m){
 }
 function memExtra(m){ return rest(m, MEM_SHOWN); }
 
+// Disks: a line per physical drive (I/O over the last interval, busy, temperature), then a
+// space bar per real filesystem with the drive it lives on. No rate before the second tick.
+function diskLive(dk){
+  if (!dk || !((dk.disks || []).length || (dk.fs || []).length))
+    return `<h3>Disks</h3><div class="sub">no block devices readable</div>`;
+  const gib = b => b == null ? '—' : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 0 : 1);
+  const drives = (dk.disks || []).map(d => {
+    const crit = d.temp_crit || 85;
+    const tcls = d.temp == null ? '' : d.temp >= crit - 5 ? 'crit' : d.temp >= crit - 15 ? 'warn' : 'ok';
+    const rate = d.read_mbs == null ? '<span class="dim">rates from the next tick</span>'
+      : `r <b>${n(d.read_mbs, 1)}</b> · w <b>${n(d.write_mbs, 1)}</b> MB/s · ${n((d.read_iops || 0) + (d.write_iops || 0))} IOPS`;
+    return `<div class="lbl"><span>${E(d.model)} <span class="dim">${gib(d.size)} GiB · ${E(d.name)}</span></span><b>${
+        d.temp == null ? '' : `<span class="${tcls}">${n(d.temp)}°C</span>`}</b></div>
+      ${row('I/O', rate)}
+      ${d.busy == null ? '' : `<div class="lbl"><span>busy</span><b>${pc(d.busy)}</b></div>${bar(d.busy, d.busy >= 80 ? 'warn' : '')}`}`;
+  }).join('');
+  const fss = (dk.fs || []).map(f => `
+      <div class="lbl"><span class="mono">${E(f.mount)}</span><b>${gib(f.used)} / ${gib(f.total)} GiB · ${pc(f.used_pct)}</b></div>
+      ${bar(f.used_pct, f.used_pct >= 95 ? 'crit' : f.used_pct >= 85 ? 'warn' : '')}
+      <div class="sub">${f.network ? 'network · ' + E(f.source) : E(f.on || f.source)} · ${E(f.fstype)}</div>`).join('');
+  return `<h3>Disks</h3><div class="sub">${(dk.disks || []).length} drives · ${(dk.fs || []).length} filesystems</div>
+    ${drives}<div class="g">filesystems</div>${fss}`;
+}
+
 function powerLive(s){
   const p = s.power || {};
   const notes = (p.notes || []).length
@@ -1072,6 +1097,7 @@ function render(s){
   (s.gpus || []).forEach(g => mount('g-gpu', 'gpu' + g.index, gpuLive(g), gpuExtra(g), seen));
   mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
   mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
+  mount('g-sys', 'disk', diskLive(s.disks), '', seen);
   mount('g-sys', 'pwr', powerLive(s), '', seen);
   (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, (d.flavor === 'vLLM' || d.flavor === 'radiance') ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
   prune(seen);
