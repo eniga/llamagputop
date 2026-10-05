@@ -1,77 +1,298 @@
-llamagputop
+# llamagputop
 
-This is a terminal monitor for Linux that tracks your GPUs and llama.cpp, vLLM and radiance inference in a single Python file. It doesn't need any external dependencies beyond the standard library.
-In order to work correctly and completely --metrics must be activated on your llama.cpp servers, chmod 755 and sudo will help with all the remaining metrics. Everything can work anyway (but with less data). 
+A monitor for Linux machines that serve local LLMs. It shows the GPUs, CPU, memory, disks and
+power draw beside every inference server running on the box: **llama.cpp**, **vLLM** and
+**radiance**. Each server gets its own panel with prefill and decode speed, KV cache fill,
+speculative-decoding acceptance and the flags it was launched with.
+
+It has two front ends that read the same numbers:
+
+- `llamagputop.py`, a curses terminal UI that also has one-shot and logging modes for scripts.
+- `dashboard.py`, a web dashboard with a JSON API, meant to run as a systemd service.
+
+Both are single files that use only the Python standard library, so there is nothing to install.
 
 ```text
- llamagputop · 2 GPUs · llama: 5 servers                     14:23:07 
+ llamagputop · 3 GPUs · llama: Qwen3.8-Flash-Next                                 14:43:00
+ ╭─ AMD · Navi 48 [Radeon AI PRO R9700] ──────────────────── PCIe 32 GT/s x8 · 31.5 GB/s ─╮
+ │ util ▌░░░░░░░░░░░░░   3% │ avg 4% │ mem 0% │ media 0%                                  │
+ │ vram ██████████████ 32519/32624 MiB │ edge 39°C │ junction 41°C │ mem 40°C             │
+ │ vrm gfx 41°C │ vrm soc 39°C │ vrm mem 40°C │ core 41 MHz │ vmem 96 MHz │ fclk 582 MHz  │
+ │ soc 417 MHz │ power 18/240 W │ vdd 619 mV │ fan 1200 rpm (24%)                         │
+ ╰────────────────────────────────────────────────────────────────────────────────────────╯
+ ╭─ Intel · Arrow Lake-S [Intel Graphics] ────────────────────────────────────────────────╮
+ │ util ░░░░░░░░░░░░░░ — │ core 0 MHz │ range 550–2000 eff 550 MHz                        │
+ │ no data util — needs intel_gpu_top │ vram — not reported by nvtop for this card        │
+ │         temp, power — no hwmon node on this card                                       │
+ ╰────────────────────────────────────────────────────────────────────────────────────────╯
+ ╭─ disks ───────────────────────────────────────────────────────────────────── 2 drives ─╮
+ │ WD_BLACK SN850X HS 2000G 1863 GiB │ r 0.0 w 0.0 MB/s │ 0 IOPS │ busy 0% │ 56°C         │
+ │ Lexar SSD EQ790 2TB      1863 GiB │ r 0.0 w 0.0 MB/s │ 0 IOPS │ busy 0% │ 52°C         │
+ │ /                      █████▊░░░░░░░░ 746/1830 GiB 43% │ on WD_BLACK SN850X HS 2000GB  │
+ │ /mnt/radiance-state    ███▉░░░░░░░░░░ 53/196 GiB 29% │ on Lexar SSD EQ790 2TB          │
+ ╰────────────────────────────────────────────────────────────────────────────────────────╯
+ ╭─ radiance ─────────────────────────────────────────────────────────────────────────────╮
+ │ status   idle   ctx 200000/request · pool 486464 tok · 8 seqs max   active 0, queued 0 │
+ │ prefill — (idle) │ gen — (idle) │ session —/176.2 t/s avg                              │
+ │ kv ░░░░░░░░░░░░░░ 0.0%  0/486464 tok │ prompt reuse 9.8% │ preempted 0                 │
+ │ head mtp in container n-max 3 │ draft 57.7% accepted  2.73 tok/step                    │
+ │ per pos  74% 76% 78%                                                                   │
+ │ engine   1.0.8 │ step 15.5 ms decode │ experts 98.6% in VRAM │ pcie 0.00 GB/s h2d      │
+ ╰────────────────────────────────────────────────────────────────────────────────────────╯
+ ╭─ llama processes ──────────────────────────────────────────────────────────────────────╮
+ │  453408 Qwen3.8-Flash-Next         RSS 30673M   VRAM 32376M   GTT 8M                   │
+ ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
-╭─ Intel · TigerLake-H GT1 [UHD Graphics] ──────────────────────────╮
-│ util █▊░░░░░░░░░░░░  12% │ avg 9% │ core 350 MHz                   │
-│ range 350–1450 eff 600 MHz                                         │
-│ no data vram — memory is shared with system RAM                    │
-│         temp, power — no hwmon node on this card                   │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ NVIDIA · GA106M [GeForce RTX 3060 Mobile / Max-Q] ───────────────╮
-│ util ████████▋░░░░░  62% │ avg 41% │ mem 18%                       │
-│ vram ██████████▎░░░ 4512/6144 MiB │ gpu 68.0°C │ core 1425.0 MHz   │
-│ vmem 7000.0 MHz │ power 85/115 W                                   │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ llama processes ─────────────────────────────────────────────────╮
-│ 1738957 GigaChat3.1-10B-A1.8B-q4_K RSS 6393M   VRAM — (CPU only)  │
-│ 1730176 Ling-3.0-tiny-MXFP4_MOE    RSS 4209M   VRAM — (CPU only)  │
-│ 1730591 gemma4-e4b-sft-claude-opus RSS 3542M   VRAM — (CPU only)  │
-│ 1701115 bge-m3-clean-random-Q6_K   RSS 1272M   VRAM — (CPU only)  │
-│ 1737341 bge-reranker-v2-m3-Q6_K    RSS  752M   VRAM — (CPU only)  │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ power ───────────────────────────────────────────────────────────╮
-│ NVIDIA 85/115 W │ CPU 45 W                                         │
-│ total 130 W  avg 118 W  peak 180 W                                 │
-│ session 1h04m  energy used 126.1 Wh                                │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ llama.cpp (1738957: 8080) ───────────────────────────────────────╮
-│ status  generating  ctx 5120/slot · 10240 total (2 slots)  active 1 │
-│ prefill 24 t/s last │ gen 28.7 t/s (med 28.7±0.3)                  │
-│ kv ▎░░░░░░░░░░░  1.1%  115/10240 tok │ budget 107/150              │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ llama.cpp (1730176: 8081) ───────────────────────────────────────╮
-│ status    idle         ctx 8192     active 0, queued 0             │
-╰───────────────────────────────────────────────────────────────────╯
-╭─ trends ──────────────────────────────────────────────────────────╮
-│ util %  ▂▃▃▄▅▆▇██████████████████████████████████████████████████ │
-│ gen t/s ░░░░░░░░░░░▂▂▃▄▅▆▇███████████████████████████████████████ │
-╰───────────────────────────────────────────────────────────────────╯
+ q quit · ↑↓ PgUp/PgDn scroll · +/- rate 1s · z reset
 ```
 
-It watches every GPU in your machine including AMD, Intel, and NVIDIA, along with your CPU, RAM, and power draw. What sets this tool apart from others is the llama.cpp panel. It automatically detects every running llama server and shows you the metrics that actually matter when serving a model. You can see your prefill and generation speed with live medians and standard deviations. A speed is shown live only while a request is actually running; once it finishes, the rate it ran at is kept and marked "last" rather than left standing as if it were the current one. Start your server with --metrics and the completed-request figures come from the server's own counters, which is the exact number it timed itself. The time to first token is read from those same counters rather than clocked here, because the server knows it exactly while polling would carry the refresh interval as its error bar; when several slots finished inside one interval the figure is a summed prefill time and is named as such, since a sum of waits is not a wait. It also shows you your KV cache fill, aggregated across every slot, and it reads every slot rather than the first — a server started with -np 2 hands a request to whichever slot is free. If you use speculative decoding, it tells you which draft head is in use, its acceptance rate, the tokens per step, and the per position acceptance. These inference statistics are tied directly to the model, meaning they reset automatically when the model changes.
+*An excerpt from a live frame on a dual Radeon AI PRO R9700 box serving Qwen3.8-Flash-Next on
+radiance. The full screen also has a summary strip, the second GPU, CPU, memory, power, the
+server's launch config and trend sparklines.*
 
-I designed this tool to read everything directly from the source. Data is pulled from sysfs, proc, and the driver. It can use optional helpers like intel gpu top or nvidia smi only if they are present on your system. It never blindly trusts a sensor. Any out of range readings are dropped and it just keeps the last good value. If a card, a tool, or a counter is missing, it honestly shows a dash with a reason instead of giving you a fake zero — a server started without --metrics has no prefill counter, and that is not the same thing as a prefill of zero. That holds for the cards too, and the reason is written for the thing that is actually missing. Where the answer is a program, it names the BINARY and not a package, since package names differ between distributions while binaries do not: a machine without nvidia-smi reads "no data · util, vram, temp, power, clocks — needs nvidia-smi" instead of an empty panel. On AMD, though, almost everything comes from sysfs, so naming a binary would send you after a package that changes nothing; there the reason names the driver attribute or the missing node instead, as in "gpu_busy_percent not exposed by this driver" or "no power1_average on this hwmon node". An integrated GPU says its memory is the system's rather than drawing a bar against the whole of RAM, and it knows which it is by measurement rather than by its name — a discrete Arc is an Intel card with real VRAM, so what decides it is whether the total reported for the card is the machine's own RAM total. The same care applies in the other direction, to readings that are genuinely zero: a card in zero-fan mode reports 0 rpm and is shown as stopped rather than as having no tachometer, an idle GPU reads 0% and says so, and 0 watts is a measurement while an unreadable meter is a dash. The fan percentage beside the rpm is the share of the fan's declared top speed (`fan1_max`), the same quantity the rpm measures; the pwm duty cycle the firmware commands runs a few points higher and drifts further with speed, so it is used only on cards that declare no top speed. AMD power is averaged rather than sampled: the SMU refreshes `power1_average` about every 50 ms, so a single read per refresh lands on whatever that window held, which on two R9700s capped at 240 W meant readings from 226 to 306 W around a true 239 W, and a session peak made of spikes. A background reader samples each card ten times a second and every refresh shows the mean of what it saw. These cards have no energy counter to difference instead. Inference is read on its own thread, so a server busy enough to stop answering slows nothing down on screen: the rest of the panel keeps its once-a-second refresh and the stalled server says so.
+## Where this came from
 
-It features a summary strip at the top for quick glances at your generation speed, free VRAM, and total watts. Below that, it generates trend sparklines so you can see exactly when something changed. Each one is a strip chart: one column per refresh, newest on the right, sliding left as time passes. The scale is fitted to the range the data actually occupies rather than anchored at zero, so a metric living in a narrow band still shows its shape, and it is snapped to a round step so the graph scrolls instead of flickering. Every row carries the peak for the whole session, and a bar that does not start at zero says where its floor is. The KV cache has a row of its own on generative servers, and unlike the speed rows it keeps its real value while the server is idle: a slot that is not working still holds its conversation, so recording a zero there would draw a collapse that never happened. Percentages keep their absolute scale. A dot means a true zero and nothing else. The script enumerates your DRM cards and identifies the driver and vendor, bringing you all the deep hardware metrics like temperatures, clocks, core voltage, and GTT versus VRAM eviction data. On AMD the VRM figures are temperatures and are shown as such: the binary metrics blob reports them in degrees, its own voltage fields read as unsupported on the cards checked, and the real core voltage comes from hwmon. All three regulators are read, graphics, SoC and memory, and they join hwmon's edge, junction and memory sensors in one list; the memory regulator is not published by hwmon at all, so the blob is the only place it appears. The headline temperature names its sensor. It is the junction reading when the card has one, which runs about 25 °C above the edge reading nvtop shows, and an unlabelled 91 °C beside nvtop's 66 °C would otherwise read as a fault. 
+This is a fork of [XscannedX/llamagputop](https://github.com/XscannedX/llamagputop), which
+released version 1.0.7.0 in August 2026 as a terminal monitor for GPUs plus llama.cpp. The fork
+has kept that project's principles: one file, no dependencies, everything read at its source,
+and a dash with a reason in place of a made-up number. Beyond that it has grown in several
+directions:
 
-Every server is found just by scanning the process list, so there are no ports to configure. If you run multiple servers, they each get their own dedicated panel automatically. The process list intelligently analyzes your active models and distinguishes between those running on the GPU and those running strictly on your CPU, explicitly labeling CPU-only RAM usages so you are never left guessing where your memory went. On AMD and Intel that split comes from the kernel, which reports device memory separately from the host-side spill; NVIDIA does not expose those counters at all, so there the figure comes from nvidia-smi and the spill is shown as unknown rather than as zero, because one number for memory on the card cannot be divided into two. It even has a server config section that reads the settings from the command line so you know exactly how the model was loaded — every flag it was launched with, not a curated subset, so DRY, XTC, mirostat, pooling, LoRA and anything a newer llama.cpp adds all show up. API keys are masked. Sampler values there are the server's defaults, which a request carrying its own overrides, and the panel says so. 
+| Area | Upstream (1.0.7.0) | This fork |
+|---|---|---|
+| Inference engines | llama.cpp | llama.cpp, vLLM and radiance, each with its own probe and panel. llama.cpp routers are skipped. |
+| Front ends | Terminal UI | Terminal UI, plus a web dashboard with a JSON API and a systemd unit |
+| Authentication | None | Each server's API key is read from its own command line, or from `LLAMAGPUTOP_API_KEY` |
+| AMD power | One `power1_average` read per refresh | Sampled at 10 Hz on a background thread and averaged over each refresh |
+| AMD sensors | Edge/junction/mem, VRM gfx/soc | Adds the memory regulator (`temperature_vrmem`), labels the headline sensor and gives fan % of `fan1_max` |
+| PCIe | Root-port link in the TUI | The same link in both views, flagged when that port is a virtual VM one, plus the width the card's firmware reports and live rx/tx in the dashboard |
+| Storage | — | Disk panel: per-drive I/O, IOPS, busy % and temperature, with each filesystem mapped to its physical drive |
+| Tests | 76 | 156, still standard library only, with no hardware or network needed |
 
-vLLM servers are found the same way and get their own panel, filled from vLLM's own `/metrics` (always on, no flag needed) and `/v1/models`. The two engines count differently, and the panel follows what each one can actually measure. vLLM advances its generated-token counter on every engine step, so the live generation speed is that counter's slope while requests run. Its prompt counter, though, jumps by the whole prompt in the step where prefill completes, so there is no live prefill rate to sample, and the panel shows the completed figure instead. That figure, the decode speed of the request that just finished and its time to first token all come from vLLM's per-request histograms, which time each phase exactly. Prefill counts only the tokens actually computed, since prefix-cache hits cost nothing, and TTFT is a mean when several requests land in one interval, labelled with how many. The KV bar is the fraction of vLLM's shared pool, in tokens, and it is the figure to read for how full the server is: vLLM reserves its KV cache when it starts, so the card's VRAM bar sits near 100% even with nothing running. That reserved memory genuinely is unavailable to anything else, which is why the VRAM bar reports it as used. The context line reads `ctx 262144/request · pool 591218 tok · 8 seqs max` rather than llama.cpp's per-slot split, because vLLM has no slots: every sequence draws pages from one pool. The panel also shows prompt reuse from the prefix cache, speculative acceptance per position with the method and head read from `--speculative-config`, the reasoning parser, and a preemption count, which is the number to watch when the pool is too small for the load. The server config groups vLLM's flags as it does llama.cpp's, `--flag=value` form included, with the API key masked. The API server, the engine core and one worker per GPU all appear in the process list. A vLLM in a container runs as root, so its per-process VRAM needs sudo to read, and the list says so. Discovery uses the port inside the container, which is right for host networking and for the usual `-p 8000:8000`. When the host port differs, or the server is on another machine, set `LLAMAGPUTOP_VLLM=host:port[,host:port]`. The web dashboard lays the vLLM panel out around runs, a stretch of work from the first request to the last: the decode peak, average, duration and tokens of the run in progress (marked live) or the last one, the prefill figures of the requests completed in it, the cache reuse of the most recent prompts, the ingest rate, and lifetime TTFT, TPOT, end-to-end latency, prompt and answer length and totals since start.
+Everything is listed change by change in [CHANGELOG.md](CHANGELOG.md).
 
-radiance servers (Deadcode's native C++/HIP engine for RDNA4) are found in the process list too, by the `radiance` process and its `--port`; the container's init wrapper, which carries the same command line, is skipped. The panel is the vLLM one, since radiance exports vLLM's metric names and request histograms as a compatibility set, with three differences that follow from what the engine actually publishes. Its `/metrics` and `/stats` need the API key, which is read from `--api-key` on its command line like every other server's. vLLM's generation counter only moves there when a request finishes, so the live generation rate is the slope of the engine's own `radiance:decode_tokens_total`, which advances every step. And prefill is live: the engine's prefill gauge is shown while a request is in prefill and kept as `last` afterwards, never read while idle, because it decays for seconds after the work stops. On top of the vLLM rows the panel adds what only radiance has: the decode step time (decode step seconds over decode steps, so idle and prefill are not charged to it), the expected tokens per drafting step computed from the per-position acceptance (the headline acceptance ratio is conditional on having drafted and can look healthy while tokens per step collapse), the share of routed experts served from VRAM with promotions, demotions and the size of each expert tier, the PCIe traffic the engine counts, the KV held for the next turn, linear-state reuse on hybrid models, the version and the uptime. The context comes from `--max-model-len`, since `/v1/models` does not carry it, and the server configuration groups radiance's flags into loading, parallel, memory, scheduling, prefix cache, speculative, sampling and server, with the key masked.
+## Quick start
 
-For your CPU and RAM, it tracks utilisation, temperatures, frequency, RAPL power, and swap destinations like zram versus disk. Disks get a panel of their own, because the drive is part of serving now: a model's n-gram table or offloaded experts can be read from NVMe on every token, and a prefix cache can spill to disk. Each physical drive shows its read and write rate, IOPS, how busy it was over the last refresh and its temperature against the limit the drive declares. Each real filesystem shows its space, as df computes it, and the drive it actually lives on, found by walking partitions and device-mapper slaves, so an LVM volume on a thin pool still names the NVMe underneath. Partitions and device-mapper layers are not listed as drives, since their I/O is the drive's own counted again; tmpfs, overlay and bind mounts are left out; network filesystems are marked as such. The first refresh has no rates, because a rate needs two samples. The power section aggregates every readable watt meter to give you the cumulative energy drawn during your session and the energy efficiency of your models. 
+```bash
+git clone https://github.com/eniga/llamagputop.git
+cd llamagputop
+python3 llamagputop.py            # terminal UI, finds every GPU and server on its own
+python3 dashboard.py              # web dashboard on http://0.0.0.0:7778
+```
 
-The tool is completely portable. Since it discovers hardware at runtime, it runs on any Linux machine. 
+You need Linux and Python 3. There are no pip packages. With no arguments the tool finds every
+GPU, every disk and every inference server, so there are no ports to configure.
 
-The tests live in `tests/` and use the standard library only, like the program: run them with `python3 -m unittest discover -s tests`. They need no particular hardware and touch no network, since every reader is driven against a temporary directory standing in for sysfs. Most of them come in pairs, because the difficult half of "a missing reading is a dash" is proving that a real zero still reads as zero: a parked fan, a power-gated GPU, an idle server and a freshly started card are all genuinely at zero and have to survive.
+### What improves the picture
 
-To use it, just run the python script in your terminal. You can pass a port number to focus on a single server, or use the once or line flags for scripting and logging. The TUI is fully interactive. You can quit with q, scroll with your arrow keys, change the refresh rate with plus and minus, and reset the history with z.
+The tool runs without any of the following, but it shows less. Each missing piece is reported
+on screen, with a reason, in the place where its data would have been.
 
-If you want to track your CPU power, make sure your kernel allows reading the RAPL counter. You might need to add a udev rule to grant your user access to the powercap sysfs directory.
+| Add | What you get |
+|---|---|
+| `--metrics` on llama-server | Prefill/decode counters, TTFT and speculative stats. Without it, those fields read "metrics off", not zero. |
+| `sudo` or matching user | Per-process VRAM for servers owned by another user. Containerised vLLM and radiance run as root. |
+| RAPL read access | CPU package power. The TUI offers a one-off `sudo chmod` at startup. For a permanent fix, see [CPU power](#cpu-power-rapl). |
+| `nvidia-smi` | All NVIDIA card stats, per-process VRAM and dashboard PCIe throughput |
+| `amd-smi` | Dashboard PCIe rx/tx on AMD, where the driver publishes it. On RDNA it reports N/A, and the dashboard says so. |
+| `intel_gpu_top`, `nvtop` | Intel engine utilisation and VRAM |
+| `lspci` / up-to-date `pci.ids` | Product names. A new card such as the R9700 shows as "Device 7551" until `update-pciids` runs. |
 
-There is also a web dashboard, `dashboard.py`, which serves everything the terminal view collects over HTTP. It is not a second monitor with its own opinions about your hardware: it imports `llamagputop.py` as a module and drives the same collection seam the TUI uses, so the browser and the terminal are reading one set of numbers rather than two implementations of them. It reuses the same helpers for context text, for the reason a speed is unavailable, and for the medians and extremes, and it keeps the same contract about missing data — `None` and `0` stay distinct all the way through the JSON into the page, so a card with no readable power meter renders an em dash while a genuinely idle GPU renders 0%. It has no dependencies beyond the standard library either, so there is nothing to install.
+## Inference engines
 
-Run it with `python3 dashboard.py` and it listens on `0.0.0.0:7778`. A bare number changes the HTTP port, `--bind` changes the address, `--interval` changes how often it samples, and `--llama-port` focuses a single llama.cpp server the way the positional port does for the TUI. It serves `/` for the dashboard itself, `/api/metrics` for the whole snapshot as JSON, `/healthz` for whether the collector has produced a sample yet, which is what you want a proxy or a container healthcheck to poll, and `/favicon.svg` for the tab icon — a bar meter in the same three colours the page uses for ok, busy and hot, drawn as bars rather than lettering because a favicon is read at 16 px where text turns to mush. The tab is titled with the machine's hostname as soon as the first sample lands, so several of these open at once stay tellable apart. A request for `/favicon.ico`, which browsers make unprompted, is answered with a 204 rather than left to log a 404.
+Servers are found by scanning `/proc` for their processes. The port comes from each server's
+command line, every server gets its own panel, and the panels reset when the model changes.
 
-The llama.cpp panels come first, above the hardware, since whether anything is actually generating is the usual reason for opening the page and it should not need a scroll. Below them the page shows a card per GPU with utilisation, VRAM, power against the card's cap, temperatures from every sensor the driver exposes, both clocks, and a sparkline of recent utilisation with its session min, average and peak. Each card also carries a bandwidth block: the PCIe link at the root port the card hangs from, as negotiated right now and at its maximum, both converted to GB/s through the same encoding-efficiency table the terminal view uses, the narrowest hop in the chain when that is the real limit, and live rx/tx throughput streamed from `nvidia-smi dmon`. Reading the two link figures together is the point: a link sitting at 2.5 GT/s while idle is power management and comes back the moment work arrives, but a width below what the card is capable of is physical, usually a slot bifurcated because a second card is in the machine, and it will not recover. The root port is read rather than the card's own node because some cards carry a switch of their own: on a Radeon AI PRO R9700 the card's node describes the hop to that on-card switch, 32 GT/s x16, while the slot ran x8. The terminal view reads the same port, so the two agree. Inside a virtual machine that root port is the hypervisor's emulated one and advertises whatever the hypervisor chose, so it is marked as a virtual root port, the narrowed-link warning is suppressed since no slot is narrowed, and the width the card's own firmware reports from its metrics blob is shown beside it, because in a VM that is the only place the physical width appears. Peak VRAM bandwidth is deliberately not shown. It needs the memory bus width, which no driver here exposes, not in `nvidia-smi -q`, not as a query field, not in sysfs, and deriving it from a table of product names would be exactly the invented number this project refuses to print, so the memory side reports its clock and its controller utilisation and says why the rest is missing. The CPU and memory cards carry utilisation, frequency, load average, temperatures, RAPL power, and the full memory breakdown down to zram versus disk swap. Each llama.cpp server gets its own panel with prefill and generation speed, a last-known rate explicitly marked "last" rather than dressed up as current, time to first token, context, KV cache fill, slot occupancy, speculative decoding acceptance and draft type, and the power attributed to the cards that server is actually running on. The server's full launch configuration is there too, grouped as the TUI groups it, with API keys masked. Every panel ends with an "all fields" section listing whatever keys the collector returned that the panel above did not already show, so a metric added to `llamagputop.py` later appears in the web view on its own rather than being silently dropped, and the raw snapshot is at the bottom of the page for when you want the JSON. The browser polls once a second; nothing is pushed, so it survives a reverse proxy that buffers.
+| | llama.cpp | vLLM | radiance |
+|---|---|---|---|
+| Found by | `llama-server` process. Routers (`--models-dir`/`--models-preset`) are skipped, and their per-model children are probed. | `vllm` / python process running `vllm serve` | `radiance` process (its `docker-init` wrapper is skipped) |
+| Endpoints | `/metrics`, `/slots`, `/props` | `/metrics` (no auth), `/v1/models` | `/metrics`, `/stats`, `/v1/models` (all need the key) |
+| Live decode | Slope of the busy slots' progress in `/slots`, because `/metrics` only moves when a request ends | Slope of `vllm:generation_tokens_total` | Slope of `radiance:decode_tokens_total`, because the vLLM-compatible counter only moves when a request ends |
+| Prefill | Live, then `last` | The last completed request, from histograms. The prompt counter jumps once per request, so no live rate exists. | Live from the engine's gauge during prefill, then `last`. The gauge isn't read while idle because it decays. |
+| KV cache | Summed over every slot | Fraction of the shared page pool, in tokens | Same as vLLM |
+| Context line | `ctx N/slot · total (k slots)` | `ctx N/request · pool P tok · S seqs max` | Same as vLLM, with ctx taken from `--max-model-len` |
+| Speculative | Draft head, acceptance, tokens/step, per position | Method/head from `--speculative-config`, per-position acceptance | Adds expected tokens per drafting step, computed from per-position acceptance |
+| Extras | TTFT from server counters, slot occupancy | Prefix-cache reuse, preemptions, reasoning parser, TTFT/TPOT/e2e | Decode step time, experts held in VRAM with promotions/demotions, engine PCIe traffic, KV held for the next turn, linear-state reuse, version, uptime |
 
-To keep it running across reboots, install it as a systemd service. The unit in this repository, `llamagputop-dashboard.service`, carries no username and no paths: its `[Service]` section is deliberately left incomplete, and the command below appends `User=`, `Group=`, `WorkingDirectory=` and `ExecStart=` to it, filled in from the account you are logged in as and from wherever you cloned the repository. Run it from inside the checkout, as your normal user — do not put `sudo` in front of the whole block, or the appended user becomes root, which is both wrong and unnecessary since nothing here needs privilege.
+Rules shared by all three engines:
+
+- **A speed is live only while a request is running.** When the request finishes, the panel
+  keeps the rate it ran at and labels it `last`.
+- **Counters come from the server, not from this tool's own timing.** Timing by polling would
+  add the refresh interval as an error. When several requests finish inside one refresh, TTFT
+  becomes a mean or a summed prefill time, and the label says which.
+- **The server config panel shows every launch flag**, grouped by role (loading, parallel,
+  memory, scheduling, prefix cache, speculative, sampling, server). Nothing is picked out of a
+  fixed list, so flags added by newer engine versions appear without code changes. API keys are
+  masked. Sampler values are labelled as server defaults, since a request's own settings
+  override them.
+- **On vLLM and radiance, read the KV bar to judge how full the server is.** These engines
+  reserve their KV pool at startup, so the VRAM bar sits near 100% even when nothing is
+  running. That memory really is unavailable to anything else, and the VRAM bar counts it as
+  used.
+- **Each probe runs on its own thread.** A server that stops answering doesn't slow the screen.
+  After a timeout the probe backs off, and the panel shows that it is doing so.
+
+To reach a server that discovery can't see, use these variables:
+
+```bash
+LLAMAGPUTOP_VLLM=host:port[,host:port]   # vLLM on another machine, or a container whose host port differs from its internal one
+LLAMAGPUTOP_API_KEY=...                   # key for a server whose command line can't be read
+```
+
+## Hardware
+
+**GPUs.** DRM cards are enumerated from sysfs and read through the vendor's own interfaces:
+
+- **AMD:** `amdgpu` sysfs, hwmon and the binary `gpu_metrics` blob (v1.3 decoded field by
+  field). You get utilisation and memory-controller/media activity, VRAM and GTT, the edge,
+  junction and memory temperatures, all three VRM temperatures, the gfx, memory, fabric and SoC
+  clocks, core voltage, fan rpm with % of `fan1_max`, the throttle state, and power against the
+  cap.
+- **NVIDIA:** a persistent `nvidia-smi` feed, including per-process VRAM. The NVIDIA driver
+  doesn't put VRAM in `fdinfo`.
+- **Intel:** i915/xe sysfs, `intel_gpu_top` for engine utilisation and `nvtop` for VRAM.
+  Whether a card is integrated is measured, not guessed from its name: when the card reports a
+  total equal to `MemTotal`, it shares system RAM and gets no VRAM bar, while a discrete Arc
+  keeps its bar.
+
+**PCIe.** The link shown is the one at the root port the card hangs from. A card's own node can
+describe a switch on the card itself; on an R9700 that node reads 32 GT/s x16 while the slot
+runs x8. If the root port is QEMU's emulated one, the panel marks it as virtual, drops the
+"narrowed link" warning and shows the width that the card's firmware reports from
+`gpu_metrics`. Link speed is shown as negotiated and maximum, converted to GB/s with the
+encoding overhead taken out.
+
+**CPU, memory and power.** The tool reads CPU utilisation, per-core temperatures, frequency,
+load average and RAPL package power. Memory is broken down into cached, buffers, dirty,
+committed and swap, with zram and disk swap shown separately. The power panel adds up every
+readable meter and tracks session energy in Wh.
+
+**Disks.** Each physical drive shows its read/write MB/s, IOPS, busy share of the last refresh
+and its temperature against the limit it declares (the NVMe controller sensor, or `drivetemp`
+for SATA). Each real filesystem shows its used space as `df` computes it, plus the drive it
+actually lives on. That drive is found by walking partitions and device-mapper slaves, so an
+LVM volume on a thin pool still names the NVMe underneath it. Partitions and dm/md layers are
+not listed as drives, so no I/O is counted twice. tmpfs, overlay and bind mounts are skipped.
+Network filesystems are marked as network.
+
+**Processes.** Every inference process is listed with its RSS, VRAM and GTT. On AMD and Intel,
+the kernel's `fdinfo` separates device memory from host spill. On NVIDIA it can't be split, so
+spill shows as unknown, not as zero.
+
+## Design
+
+**What the tool promises**
+
+- **Read at the source.** Data comes from `/sys`, `/proc`, the driver and the server's own
+  counters. Optional vendor tools are used only when they are installed.
+- **`None` and `0` are different facts.** An idle GPU shows 0%. A card with no readable power
+  meter shows `—`. A parked fan reads "stopped", not "no tachometer". This distinction is kept
+  through to the dashboard's JSON.
+- **Every dash explains itself.** When the fix is a program, the reason names the binary, as in
+  "needs nvidia-smi", because package names differ between distributions. On AMD, where the
+  data comes from sysfs, the reason names the missing attribute instead, as in
+  "gpu_busy_percent not exposed by this driver".
+- **No sensor is trusted blindly.** Readings outside a sane range are dropped, and the last good
+  value is kept.
+- **Numbers are measured, not looked up.** For example, the tool shows no peak VRAM bandwidth.
+  That figure needs the memory bus width, which no driver exposes, and deriving it from a table
+  of product names would be exactly the kind of invented number this project avoids.
+
+**How it fits together**
+
+```text
+                       llamagputop.py
+ ┌────────────────────────────────────────────────────────────────┐
+ │ discover_gpus()  AmdGpu / IntelGpu / NvidiaGpu .sample()       │
+ │   background feeds: _AmdPowerFeed (10 Hz), _NvidiaFeed,        │
+ │   _IntelEngineFeed, _NvtopVramFeed                             │
+ │ cpu_sample() mem_sample() disk_sample() llama_processes()      │
+ │ _LlamaFeed thread → sample_llama_fleet()                       │
+ │   discover_llama_servers() → LlamaProbe                        │
+ │                              └─ VllmProbe ─ RadianceProbe      │
+ │ _collect()  ← the one collection seam                          │
+ └───────────────┬────────────────────────────────┬───────────────┘
+                 │                                │
+       curses TUI / --once / --line         dashboard.py (imports it)
+                                            Collector thread → build_snapshot()
+                                            PcieFeed (nvidia-smi / amd-smi / intel_gpu_top)
+                                            ThreadingHTTPServer → / , /api/metrics
+```
+
+The web dashboard has no collection code of its own. It imports `llamagputop.py` and calls the
+same `_collect()` as the TUI, and it reuses the TUI's helpers for context text, for
+"unavailable because" reasons, and for medians and extremes. The browser and the terminal
+therefore always agree. The only thing the dashboard reads for itself is PCIe throughput,
+because that needs a long-running vendor process.
+
+The class hierarchy follows the engines. `VllmProbe` extends `LlamaProbe`, and `RadianceProbe`
+extends `VllmProbe`, because radiance exports vLLM's metric names and histograms. Each subclass
+overrides only the parts where its engine measures differently.
+
+## Terminal UI
+
+```text
+llamagputop.py [PORT] [--once | --line | --probe]
+
+  PORT      focus one server's port. Omit it to show every server.
+  --once    print one status line and exit       (scripts)
+  --line    print a status line every refresh    (logging)
+  --probe   dump the detected hardware and servers, then exit
+```
+
+Keys: `q` quits, `↑↓ PgUp PgDn Home End` scroll, `+`/`-` change the refresh rate, and `z`
+resets history. The tool honours `NO_COLOR`.
+
+The **trend** panel draws strip charts with one column per refresh and the newest on the right.
+The scale fits the range the data actually occupies and snaps to a round step. Each row shows
+its session peak, and a row whose scale doesn't start at zero shows its floor. A dot always
+means a true zero. On a generative server the KV row keeps its value while the server is idle,
+because an idle slot still holds its conversation.
+
+### CPU power (RAPL)
+
+Most kernels let only root read the RAPL energy counter, as a side-channel mitigation. To make
+it readable for good, add a udev rule:
+
+```bash
+echo 'SUBSYSTEM=="powercap", KERNEL=="intel-rapl:*", RUN+="/bin/chmod a+r /sys%p/energy_uj"' \
+  | sudo tee /etc/udev/rules.d/99-rapl.rules
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=powercap
+```
+
+## Web dashboard
+
+```text
+python3 dashboard.py [PORT] [--bind ADDR] [--llama-port N] [--interval S]
+```
+
+The defaults are `0.0.0.0:7778` with a 1 s refresh.
+
+| Path | Serves |
+|---|---|
+| `/` | The dashboard page. It polls once a second, with no push, so it works behind buffering proxies. |
+| `/api/metrics` | The whole snapshot as JSON: `gpus`, `cpu`, `mem`, `disks`, `power`, `llamas`, `procs`, plus `host`, `ts` and `uptime_s` |
+| `/healthz` | 200 once the first sample is in. Use it for proxy or container health checks. |
+| `/favicon.svg` | Tab icon. `/favicon.ico` gets a 204. |
+
+The page puts the inference panels first, then a card for each GPU. A GPU card shows its
+utilisation sparkline with min/avg/peak, VRAM, power against the cap, every temperature
+sensor, the clocks, the PCIe link with live rx/tx and the narrowest hop in the chain, and the
+power used by the cards that a given server runs on. CPU, memory and disks follow. vLLM and
+radiance panels are organised around **runs**, meaning the stretch from a run's first request
+to its last. A run panel shows decode peak, average, duration and tokens for the live or last
+run, prefill for the requests completed in it, prompt-cache reuse and ingest rate, and lifetime
+TTFT, TPOT and end-to-end latency. Every panel ends with an *all fields* section that lists any
+collector key the panel didn't already show, so a new metric appears in the web view without
+any dashboard change. The raw JSON is at the bottom of the page.
+
+### Run it as a service
+
+The unit file in this repo has no user or paths in it. The command below adds `User=`,
+`Group=`, `WorkingDirectory=` and `ExecStart=` for whoever runs it. Run it from inside the
+checkout as your normal user, without `sudo` in front of the whole block. Otherwise the unit's
+user becomes root, which the dashboard doesn't need.
 
 ```bash
 cd /path/to/llamagputop
@@ -85,12 +306,31 @@ cd /path/to/llamagputop
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now llamagputop-dashboard
-systemctl status llamagputop-dashboard --no-pager
 journalctl -u llamagputop-dashboard -f
 ```
 
-Change the trailing `7778` if you want a different port. If your checkout lives on a separate mount, add a `RequiresMountsFor=` line to the `[Unit]` section so systemd waits for it.
+`After=llama-server.service` sets ordering only, not a dependency. The dashboard is still useful
+with no server running, and it shouldn't stop when a server stops. If the checkout is on a
+separate mount, add `RequiresMountsFor=`.
 
-`After=llama-server.service` there is ordering and not a dependency, on purpose: the dashboard is useful with no llama.cpp server running at all and should not be torn down when one stops. If you put it behind a reverse proxy, give it its own subdomain rather than a subpath, because the page loads its assets from the site root. Put authentication in front of it if it will be reachable from outside your network: it exposes no way to start or stop anything and it masks API keys, but it does publish your model paths, ports, process IDs and hardware inventory to anyone who can open it.
+**Exposure.** The dashboard can't start or stop anything, and it masks API keys. It does show
+model paths, ports, PIDs and your hardware inventory, so put authentication in front of it
+before exposing it beyond your LAN. Behind a reverse proxy, give it its own subdomain rather
+than a subpath, because the page loads its assets from `/`.
 
-Copyright 2026 XscannedX. MIT License.
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+There are 156 tests. They use only the standard library and need no particular hardware or
+network: every reader runs against a temporary directory that stands in for sysfs, or against a
+stub feed or HTTP response. Most tests come in pairs, one proving that a missing reading shows
+as a dash and one proving that a real zero (a parked fan, an idle server, a power-gated GPU)
+still shows as zero.
+
+## License
+
+MIT. The original work is © 2026 XscannedX (see [LICENSE](LICENSE)). The changes made in this
+fork are released under the same license.

@@ -1,6 +1,6 @@
 [Unit]
 Description=llamagputop web dashboard
-Documentation=https://github.com/XscannedX/llamagputop
+Documentation=https://github.com/eniga/llamagputop
 Wants=network-online.target
 After=network-online.target
 # Ordering only, never a dependency: the dashboard is useful with no llama.cpp
