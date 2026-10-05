@@ -1345,5 +1345,128 @@ class RadianceProbeRates(Base):
             lgt._probes.clear(); lgt._probes.update(saved[2])
 
 
+class Disks(Base):
+    """disk_sample() against a fake /sys/block + /sys/class/block + /proc tree."""
+
+    def write(self, path, value):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(str(value))
+
+    def setUp(self):
+        super().setUp()
+        saved = (lgt.SYS_BLOCK, lgt.SYS_CLASS_BLOCK, lgt.PROC_DISKSTATS, lgt.PROC_MOUNTS,
+                 lgt.time, dict(lgt._disk_prev))
+        # registered before anything is patched: a cleanup runs even when setUp fails part
+        # way, which tearDown does not, and a leaked fake clock breaks every later test
+        self.addCleanup(self._restore, saved)
+        r = self.root
+        lgt.SYS_BLOCK, lgt.SYS_CLASS_BLOCK = f"{r}/sys/block", f"{r}/sys/class/block"
+        lgt.PROC_DISKSTATS, lgt.PROC_MOUNTS = f"{r}/proc/diskstats", f"{r}/proc/mounts"
+        lgt._disk_prev.clear()
+        self.clock = FakeClock()
+        lgt.time = self.clock
+        nv = f"{lgt.SYS_BLOCK}/nvme0n1"
+        for f, v in (("size", 3907029168), ("device/model", "WD_BLACK SN850X HS 2000GB  "),
+                     ("queue/rotational", 0), ("device/hwmon3/temp1_input", 56850),
+                     ("device/hwmon3/temp1_crit", 93850), ("nvme0n1p3/partition", 3)):
+            self.write(f"{nv}/{f}", v)
+        self.write(f"{lgt.SYS_BLOCK}/loop0/size", 1000)                  # never a drive
+        self.write(f"{lgt.SYS_BLOCK}/sda/size", 0)                       # empty reader slot
+        os.makedirs(lgt.SYS_CLASS_BLOCK)
+        os.symlink(nv, f"{lgt.SYS_CLASS_BLOCK}/nvme0n1")
+        os.symlink(f"{nv}/nvme0n1p3", f"{lgt.SYS_CLASS_BLOCK}/nvme0n1p3")
+        # dm-1 (an LVM volume) on dm-0 (a thin pool) on nvme0n1p3
+        for dm, slave in (("dm-0", "nvme0n1p3"), ("dm-1", "dm-0")):
+            os.makedirs(f"{lgt.SYS_CLASS_BLOCK}/{dm}/slaves")
+            os.symlink(f"{lgt.SYS_CLASS_BLOCK}/{slave}", f"{lgt.SYS_CLASS_BLOCK}/{dm}/slaves/{slave}")
+        self.mnt = {k: f"{r}/mnt/{k}" for k in ("root", "bind", "tmp", "nas")}
+        for d in self.mnt.values():
+            os.makedirs(d)
+        os.makedirs(f"{r}/dev")
+        os.symlink(f"{lgt.SYS_CLASS_BLOCK}/dm-1", f"{r}/dev/dm-1")       # stands in for /dev/dm-1
+        self.dev = f"{r}/dev/dm-1"
+        self.write(lgt.PROC_MOUNTS, "\n".join([
+            f"{self.dev} {self.mnt['root']} ext4 rw 0 0",
+            f"{self.dev} {self.mnt['bind']} ext4 rw 0 0",                  # bind mount: same source
+            f"tmpfs {self.mnt['tmp']} tmpfs rw 0 0",
+            f"nas:/export {self.mnt['nas']} nfs4 rw 0 0"]) + "\n")
+
+    @staticmethod
+    def _restore(saved):
+        (lgt.SYS_BLOCK, lgt.SYS_CLASS_BLOCK, lgt.PROC_DISKSTATS, lgt.PROC_MOUNTS,
+         lgt.time, prev) = saved
+        lgt._disk_prev.clear(); lgt._disk_prev.update(prev)
+
+    def stats(self, reads, sect_r, writes, sect_w, io_ms):
+        line = lambda name, *v: " ".join(["259", "0", name] + [str(x) for x in v])
+        self.write(lgt.PROC_DISKSTATS, "\n".join([
+            line("nvme0n1", reads, 0, sect_r, 0, writes, 0, sect_w, 0, 0, io_ms, 0),
+            line("loop0", 5, 0, 5, 0, 0, 0, 0, 0, 0, 1, 0),
+            line("dm-1", reads, 0, sect_r, 0, writes, 0, sect_w, 0, 0, io_ms, 0)]) + "\n")
+
+    def sample(self, dt=1.0, **kw):
+        self.clock.t += dt
+        self.stats(**kw)
+        return lgt.disk_sample()
+
+    def test_only_physical_drives_are_listed(self):
+        dk = self.sample(reads=0, sect_r=0, writes=0, sect_w=0, io_ms=0)
+        self.assertEqual([d["name"] for d in dk["disks"]], ["nvme0n1"])
+        self.assertEqual(dk["disks"][0]["model"], "WD_BLACK SN850X HS 2000GB")
+
+    def test_first_sample_has_no_rates_second_has_them(self):
+        first = self.sample(reads=100, sect_r=1000, writes=10, sect_w=100, io_ms=0)["disks"][0]
+        self.assertIsNone(first["read_mbs"])
+        self.assertIsNone(first["busy"])
+        d = self.sample(dt=2.0, reads=300, sect_r=1000 + 409600, writes=30, sect_w=100 + 2048,
+                        io_ms=500)["disks"][0]
+        self.assertAlmostEqual(d["read_mbs"], 409600 * 512 / 2 / 1e6)
+        self.assertAlmostEqual(d["write_mbs"], 2048 * 512 / 2 / 1e6)
+        self.assertAlmostEqual(d["read_iops"], 100.0)
+        self.assertAlmostEqual(d["write_iops"], 10.0)
+        self.assertAlmostEqual(d["busy"], 25.0)
+
+    def test_an_idle_drive_reads_real_zeros(self):
+        self.sample(reads=5, sect_r=5, writes=5, sect_w=5, io_ms=5)
+        d = self.sample(reads=5, sect_r=5, writes=5, sect_w=5, io_ms=5)["disks"][0]
+        self.assertEqual((d["read_mbs"], d["write_mbs"], d["busy"]), (0.0, 0.0, 0.0))
+
+    def test_a_counter_reset_is_no_rate_not_a_negative_one(self):
+        self.sample(reads=500, sect_r=5000, writes=50, sect_w=500, io_ms=50)
+        d = self.sample(reads=1, sect_r=10, writes=1, sect_w=10, io_ms=1)["disks"][0]
+        self.assertIsNone(d["read_mbs"])
+
+    def test_temperature_and_its_limit(self):
+        d = self.sample(reads=0, sect_r=0, writes=0, sect_w=0, io_ms=0)["disks"][0]
+        self.assertEqual((d["temp"], d["temp_crit"]), (56, 93))
+
+    def test_an_lvm_volume_maps_through_the_thin_pool_to_its_drive(self):
+        self.assertEqual(lgt._disk_of("dm-1"), {"nvme0n1"})
+        self.assertEqual(lgt._disk_of("nvme0n1p3"), {"nvme0n1"})
+
+    def test_filesystems_real_once_and_network_marked(self):
+        fs = self.sample(reads=0, sect_r=0, writes=0, sect_w=0, io_ms=0)["fs"]
+        self.assertEqual([f["mount"] for f in fs], [self.mnt["root"], self.mnt["nas"]])
+        root, nas = fs
+        self.assertEqual(root["disks"], ["nvme0n1"])
+        self.assertEqual(root["on"], "WD_BLACK SN850X HS 2000GB")
+        self.assertTrue(nas["network"])
+        self.assertIsNone(nas["on"])
+
+    def test_used_percent_matches_df(self):
+        f = self.sample(reads=0, sect_r=0, writes=0, sect_w=0, io_ms=0)["fs"][0]
+        st = os.statvfs(self.mnt["root"])
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        self.assertAlmostEqual(f["used_pct"], 100.0 * used / (used + st.f_bavail * st.f_frsize))
+
+    def test_panel_draws_without_a_terminal(self):
+        dk = self.sample(reads=0, sect_r=0, writes=0, sect_w=0, io_ms=0)
+        text = " ".join(t for row in lgt._disk_rows(dk, 120) for t, _a in row)
+        self.assertIn("WD_BLACK", text)
+        self.assertIn("rates from the next tick", text)
+        self.assertEqual(lgt._disk_rows(None, 120), [[("no block devices readable", lgt.DIM)]])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

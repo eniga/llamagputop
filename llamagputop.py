@@ -1150,6 +1150,140 @@ def mem_sample():
 RAM_TOTAL_MIB = mem_sample().get("total") or 0
 
 
+# ------------------------------------------------------------------- disks
+# Paths are module constants so the tests can point them at a fake tree.
+SYS_BLOCK = "/sys/block"
+SYS_CLASS_BLOCK = "/sys/class/block"
+PROC_DISKSTATS = "/proc/diskstats"
+PROC_MOUNTS = "/proc/mounts"
+# Real storage only. tmpfs, overlay, squashfs, proc and the like hold no data a model
+# server reads, and listing them buries the two numbers that matter: whether the model
+# drive is busy and whether a filesystem is about to fill.
+_REAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "vfat", "exfat", "ntfs", "ntfs3",
+            "zfs", "bcachefs", "fuseblk"}
+_NET_FS = {"nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs"}
+_disk_prev = {}                         # name -> (monotonic, sect_r, sect_w, reads, writes, io_ms)
+_disk = {"last": None}                  # the latest disk_sample(), for draw() and the dashboard
+
+
+def _is_physical(name):
+    """A whole drive, not a partition and not a virtual layer. Device-mapper (LVM, LUKS,
+    thin pools) and md are views onto drives; counting their I/O beside the drive's own
+    would show every byte twice."""
+    return not name.startswith(("loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd"))
+
+
+def _disk_of(dev, depth=0):
+    """The physical drive(s) under a block device: a partition maps to its parent, a
+    device-mapper or md device to its slaves, recursively. An LVM volume on an LVM thin
+    pool sits several layers above the NVMe it lives on."""
+    p = f"{SYS_CLASS_BLOCK}/{dev}"
+    if depth > 8 or not os.path.exists(p):
+        return set()
+    if os.path.exists(f"{p}/partition"):
+        return {os.path.basename(os.path.dirname(os.path.realpath(p)))}
+    slaves = glob.glob(f"{p}/slaves/*")
+    if slaves:
+        out = set()
+        for sl in slaves:
+            out |= _disk_of(os.path.basename(sl), depth + 1)
+        return out
+    return {dev} if _is_physical(dev) else set()
+
+
+def _disk_temp(name):
+    """Drive temperature and its critical limit in C, or (None, None). NVMe publishes it on
+    the controller's hwmon, SATA through the drivetemp driver when it is loaded."""
+    for h in glob.glob(f"{SYS_BLOCK}/{name}/device/hwmon*/temp1_input") + \
+            glob.glob(f"{SYS_BLOCK}/{name}/device/device/hwmon/hwmon*/temp1_input"):
+        t = read_int(h, None)
+        if t is None:
+            continue
+        crit = read_int(h.replace("temp1_input", "temp1_crit"), None)
+        return t // 1000, (crit // 1000 if crit else None)
+    return None, None
+
+
+def disk_sample():
+    """Every physical drive with its I/O over the last interval, and every real filesystem
+    with its space and the drive(s) it lives on.
+
+    Rates come from /proc/diskstats deltas, so the first sample has none: a rate needs two
+    points, and printing 0 MB/s for "not measured yet" is the zero this program refuses to
+    invent. busy is the share of wall time the device had I/O in flight (io_ticks), which
+    on NVMe reads high long before the drive is saturated, so it is a "doing something"
+    meter and the MB/s and IOPS beside it are the load."""
+    now = time.monotonic()
+    stats = {}
+    for line in (read(PROC_DISKSTATS, "") or "").splitlines():
+        c = line.split()
+        if len(c) >= 13:
+            try:
+                stats[c[2]] = (int(c[3]), int(c[5]), int(c[7]), int(c[9]), int(c[12]))
+            except ValueError:
+                continue
+    disks = []
+    for path in sorted(glob.glob(f"{SYS_BLOCK}/*")):
+        name = os.path.basename(path)
+        if not _is_physical(name) or name not in stats:
+            continue
+        size = read_int(f"{path}/size", 0) * 512
+        if not size:
+            continue                        # an empty card reader slot, an absent medium
+        reads, sect_r, writes, sect_w, io_ms = stats[name]
+        model = (read(f"{path}/device/model", "") or "").strip() or name
+        temp, crit = _disk_temp(name)
+        d = {"name": name, "model": model, "size": size,
+             "rotational": read(f"{path}/queue/rotational", "0").strip() == "1",
+             "temp": temp, "temp_crit": crit,
+             "read_mbs": None, "write_mbs": None, "read_iops": None, "write_iops": None,
+             "busy": None, "read_total": sect_r * 512, "write_total": sect_w * 512}
+        prev = _disk_prev.get(name)
+        if prev and now > prev[0] and sect_r >= prev[1] and sect_w >= prev[2]:
+            dt = now - prev[0]
+            d["read_mbs"] = (sect_r - prev[1]) * 512 / dt / 1e6
+            d["write_mbs"] = (sect_w - prev[2]) * 512 / dt / 1e6
+            d["read_iops"] = (reads - prev[3]) / dt
+            d["write_iops"] = (writes - prev[4]) / dt
+            d["busy"] = min(100.0, max(0.0, (io_ms - prev[5]) / (dt * 1000.0) * 100.0))
+        _disk_prev[name] = (now, sect_r, sect_w, reads, writes, io_ms)
+        disks.append(d)
+    models = {d["name"]: d["model"] for d in disks}
+    fs, seen = [], set()
+    for line in (read(PROC_MOUNTS, "") or "").splitlines():
+        c = line.split()
+        if len(c) < 3:
+            continue
+        src, target, fstype = c[0], c[1].replace("\\040", " "), c[2]
+        net = fstype in _NET_FS
+        if fstype not in _REAL_FS and not net:
+            continue
+        if src in seen:                     # a bind mount of something already listed
+            continue
+        seen.add(src)
+        try:
+            st = os.statvfs(target)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if not total:
+            continue
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        # /dev/mapper/vg-lv and /dev/disk/by-* are symlinks to the kernel name, which _disk_of reads;
+        # a network source (host:/export) is not a path at all
+        on = sorted(_disk_of(os.path.basename(os.path.realpath(src)))) if src.startswith("/") else []
+        fs.append({"mount": target, "source": src, "fstype": fstype, "total": total,
+                   "used": used, "avail": st.f_bavail * st.f_frsize,
+                   # as df computes it: of what non-root users can use, the root-reserved blocks aside
+                   "used_pct": 100.0 * used / max(1, used + st.f_bavail * st.f_frsize), "network": net,
+                   "disks": on, "on": ", ".join(models.get(x, x) for x in on) or None})
+    return {"disks": disks, "fs": fs}
+
+
+def _gib(b):
+    return "—" if b is None else f"{b / 1073741824:.0f}" if b >= 10 * 1073741824 else f"{b / 1073741824:.1f}"
+
+
 # ----------------------------------------------------- llama.cpp server probe
 def _port_of(cmd):
     """The --port a llama-server was started with (default 8080)."""
@@ -3282,6 +3416,41 @@ def _mem_rows(m, width):
     return _flow(cells, inner)
 
 
+def _disk_rows(dk, width):
+    """One line per drive (model, I/O, busy, temperature), then one per filesystem with a
+    space bar. A drive with no rate yet says so instead of drawing zeros."""
+    inner = width - 4
+    if not dk or (not dk.get("disks") and not dk.get("fs")):
+        return [[("no block devices readable", DIM)]]
+    rows = []
+    for d in dk.get("disks") or ():
+        cells = [[(f"{d['model'][:24]:<24} ", 0), (f"{_gib(d['size'])} GiB", DIM)]]
+        if d.get("read_mbs") is None:
+            cells.append([("rates from the next tick", DIM)])
+        else:
+            cells.append([("r ", DIM), (f"{d['read_mbs']:.1f}", 0), (" w ", DIM),
+                          (f"{d['write_mbs']:.1f}", 0), (" MB/s", DIM)])
+            cells.append([(f"{(d['read_iops'] or 0) + (d['write_iops'] or 0):.0f}", 0),
+                          (" IOPS", DIM)])
+            b = d["busy"]
+            cells.append([("busy ", DIM), (f"{b:.0f}%", WARN if b >= 80 else 0)])
+        if d.get("temp") is not None:
+            crit = d.get("temp_crit") or 85
+            c = CRIT if d["temp"] >= crit - 5 else WARN if d["temp"] >= crit - 15 else OK
+            cells.append([(f"{d['temp']}°C", c)])
+        rows += _flow(cells, inner)
+    bw = max(8, min(14, inner // 6))
+    for f in dk.get("fs") or ():
+        pct = f["used_pct"]
+        c = CRIT if pct >= 95 else WARN if pct >= 85 else OK
+        where = "network" if f.get("network") else (f.get("on") or f["source"])
+        cells = [[(f"{f['mount'][:22]:<22} ", 0)] + _bar(f["used"], f["total"], bw, c)
+                 + [(f" {_gib(f['used'])}/{_gib(f['total'])} GiB {pct:.0f}%", 0)],
+                 [("on ", DIM), (str(where)[:30], DIM)]]
+        rows += _flow(cells, inner)
+    return rows
+
+
 _power_peak = [0.0]
 
 
@@ -3885,6 +4054,9 @@ def draw(w, gpus_data, cpu, mem, llamas, cfgs, procs):
     blocks.append((f"CPU · {cpu.get('name', '')}", _cpu_rows(cpu, bw),
                    f"{cpu.get('ncpu', 0)} threads"))
     blocks.append(("memory", _mem_rows(mem, bw), ""))
+    dk = _disk["last"]
+    blocks.append(("disks", _disk_rows(dk, bw),
+                   f"{len((dk or {}).get('disks') or ())} drives" if dk else ""))
     blocks.append(("power", _power_rows(gpus_data, cpu, llamas, bw), ""))
     # one panel per server; the port/pid identifiers appear only when several run
     for d in llamas:
@@ -3968,6 +4140,11 @@ def _collect(gpus, explicit_port=None, lfeed=None):
             record(f"gpu{i}_vram", 100.0 * (s.get("vram_used") or 0) / s["vram_total"])
     cpu = cpu_sample()
     mem = mem_sample()
+    # kept beside the tuple rather than inside it: six callers unpack _collect()'s result
+    _disk["last"] = disk_sample()
+    for d in _disk["last"]["disks"]:
+        if d.get("busy") is not None:
+            record(f"disk_busy@{d['name']}", d["busy"])
     # the TUI hands in a feed thread and never waits; --once/--line have no loop to
     # protect and read directly
     llamas = lfeed.data if lfeed is not None else sample_llama_fleet(explicit_port)
