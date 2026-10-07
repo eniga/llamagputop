@@ -276,6 +276,14 @@ The defaults are `0.0.0.0:7778` with a 1 s refresh.
 | `/healthz` | 200 once the first sample is in. Use it for proxy or container health checks. |
 | `/favicon.svg` | Tab icon. `/favicon.ico` gets a 204. |
 
+A row of headline tiles opens the page: the busiest server's decode and prefill rate, KV
+cache, requests, TTFT and draft acceptance, then GPU utilisation, the hottest card and GPU power
+against the cap. The header carries CPU and RAM use, box power and session energy, and a
+**Basic / Advanced** toggle. Basic keeps the numbers that say whether serving works and how fast;
+Advanced adds every diagnostic row below, the disk, power, process and raw-JSON sections, and
+each panel's configuration and *all fields*. The choice is remembered per browser, and
+`?view=advanced` opens a link in Advanced. What follows describes the Advanced view.
+
 The page puts the inference panels first, then a card for each GPU. A GPU card shows its
 utilisation sparkline with min/avg/peak, VRAM, power against the cap, every temperature
 sensor, the clocks, the PCIe link with live rx/tx and the narrowest hop in the chain, and the

@@ -618,14 +618,36 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
 .banner{background:rgba(248,81,73,.12);border:1px solid rgba(248,81,73,.4);
   color:var(--crit);padding:9px 12px;border-radius:8px;margin-bottom:14px;font-size:12.5px}
 .empty{color:var(--dim);font-style:italic;padding:8px 0}
-</style></head><body>
+.seg{display:inline-flex;margin-left:auto;align-self:center;border:1px solid var(--line);
+  border-radius:7px;overflow:hidden}
+.seg button{background:transparent;color:var(--dim);border:0;padding:4px 12px;
+  font:inherit;font-size:12px;cursor:pointer}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button:hover{color:var(--fg)}
+.seg button[aria-pressed="true"]{background:var(--panel2);color:var(--fg)}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+body.basic .adv{display:none!important}
+.kpis{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:4px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--c,var(--accent));
+  border-radius:8px;padding:8px 12px;min-width:0}
+.kpi .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim)}
+.kpi .v{font-size:24px;font-weight:650;line-height:1.2;margin-top:2px}
+.kpi .v span{font-size:11.5px;font-weight:400;color:var(--dim);margin-left:4px}
+.kpi .s{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+</style></head><body class="basic">
 <header>
   <h1>llamagputop <span class="host" id="host">…</span></h1>
   <span class="stat"><span class="dot dead" id="dot"></span><span id="conn">connecting</span></span>
+  <span class="stat">CPU <b class="num" id="cpuu">—</b></span>
+  <span class="stat">RAM <b class="num" id="ramu">—</b></span>
   <span class="stat">power <b class="num" id="pwr">—</b></span>
   <span class="stat">session <b class="num" id="wh">—</b></span>
-  <span class="stat">uptime <b class="num" id="up">—</b></span>
+  <span class="stat adv">uptime <b class="num" id="up">—</b></span>
   <span class="stat">updated <b class="num" id="clock">—</b></span>
+  <div class="seg" id="view" role="group" aria-label="detail level">
+    <button type="button" data-v="basic" aria-pressed="true">Basic</button>
+    <button type="button" data-v="advanced" aria-pressed="false">Advanced</button>
+  </div>
 </header>
 <main>
   <div id="err"></div>
@@ -671,7 +693,12 @@ function spark(arr, color, maxOverride){
     <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.4"
       vector-effect="non-scaling-stroke"/></svg>`;
 }
-function row(k, v){ return `<div class="row"><span>${E(k)}</span><span class="num">${v}</span></div>`; }
+function row(k, v, cls){
+  return `<div class="row${cls ? ' ' + cls : ''}"><span>${E(k)}</span><span class="num">${v}</span></div>`;
+}
+// Basic/Advanced: anything wrapped by A() (or a row passed 'adv') is detail that only the
+// Advanced view shows. Hiding is CSS, so flipping the toggle repaints nothing.
+const A = h => h ? `<div class="adv">${h}</div>` : '';
 
 // Every field not already shown above, so nothing llamagputop collects is hidden —
 // including keys added to the tool after this dashboard was written.
@@ -716,7 +743,7 @@ function gpuLive(g){
   const virt = g.pcie_virtual ? ' <span class="dim">· virtual root port</span>' : '';
   return `
     <h3>GPU${g.index} · ${E(g.name || g.vendor || 'GPU')}</h3>
-    <div class="sub">${E(g.vendor || '')} ${g.pci_addr ? '· ' + E(g.pci_addr) : ''}</div>
+    <div class="sub adv">${E(g.vendor || '')} ${g.pci_addr ? '· ' + E(g.pci_addr) : ''}</div>
     <div class="lbl"><span>utilisation</span><b class="${g.util_state}">${pc(g.util)}</b></div>
     ${bar(g.util, g.util_state)}
     <div class="lbl"><span>VRAM</span><b>${n(g.vram_used)} / ${n(g.vram_total)} MiB · ${pc(g.vram_pct)}</b></div>
@@ -726,10 +753,11 @@ function gpuLive(g){
     <div style="margin-top:9px">
       ${row(g.temp_main_label ? `temperature (${g.temp_main_label})` : 'temperature',
           `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
-      ${temps ? row('sensors', E(temps)) : ''}
-      ${row('core clock', n(g.sclk) + ' MHz')}
-      ${row('VRAM free', n(g.vram_free) + ' MiB')}
+      ${temps ? row('sensors', E(temps), 'adv') : ''}
+      ${row('core clock', n(g.sclk) + ' MHz', 'adv')}
+      ${row('VRAM free', n(g.vram_free) + ' MiB', 'adv')}
     </div>
+    <div class="adv">
     <div class="lbl"><span>bandwidth</span><b></b></div>
     <div>
       ${row('PCIe now', link(g.pcie_gts, g.pcie_width, g.pcie_gbs) + virt)}
@@ -746,8 +774,9 @@ function gpuLive(g){
       ${row('memory controller', pc(g.mem_util))}
       ${row('VRAM peak', '<span class="dim">— bus width not exposed by the driver</span>')}
     </div>
+    </div>
     ${spark(g.util_series, 'var(--ok)', 100)}
-    <div class="lbl"><span>utilisation, recent</span><b>${
+    <div class="lbl adv"><span>utilisation, recent</span><b>${
       g.util_stats ? `min ${n(g.util_stats.min)} · avg ${n(g.util_stats.avg)} · max ${n(g.util_stats.max)}` : '—'}</b></div>`;
 }
 function gpuExtra(g){ return rest(g, GPU_SHOWN); }
@@ -760,14 +789,14 @@ function cpuLive(c){
     <h3>CPU</h3><div class="sub">${E(c.name || '')} · ${n(c.ncpu)} threads</div>
     <div class="lbl"><span>utilisation</span><b class="${c.util_state}">${pc(c.util)}</b></div>
     ${bar(c.util, c.util_state)}
-    ${row('frequency', n(c.freq) + ' MHz')}
-    ${row('load average', `<span class="mono">${E(load)}</span>`)}
     ${row('temperature', `<span class="${c.temp_state}">${n(c.temp)} °C</span>`)}
+    ${row('load average', `<span class="mono">${E(load)}</span>`, 'adv')}
+    ${row('frequency', n(c.freq) + ' MHz', 'adv')}
     ${row('package power', c.power === null
-        ? '<span class="dim">— RAPL not readable</span>' : n(c.power,1) + ' W')}
+        ? '<span class="dim">— RAPL not readable</span>' : n(c.power,1) + ' W', 'adv')}
     ${c.temps && Object.keys(c.temps).length
-      ? row('sensors', Object.entries(c.temps).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · ')) : ''}
-    ${spark(c.util_series, 'var(--accent)', 100)}`;
+      ? row('sensors', Object.entries(c.temps).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · '), 'adv') : ''}
+    ${A(spark(c.util_series, 'var(--accent)', 100))}`;
 }
 function cpuExtra(c){ return rest(c, CPU_SHOWN); }
 
@@ -778,6 +807,7 @@ function memLive(m){
     <h3>Memory</h3><div class="sub">${n(m.total)} MiB total</div>
     <div class="lbl"><span>used</span><b>${n(m.used)} / ${n(m.total)} MiB · ${pc(m.used_pct)}</b></div>
     ${bar(m.used_pct, m.used_pct >= 92 ? 'crit' : m.used_pct >= 80 ? 'warn' : '')}
+    <div class="adv">
     <div class="lbl"><span>swap</span><b>${n(m.swap_used)} / ${n(m.swap_total)} MiB</b></div>
     ${bar(m.swap_pct, m.swap_pct >= 50 ? 'warn' : '')}
     ${row('free', n(m.free) + ' MiB')}
@@ -787,7 +817,8 @@ function memLive(m){
     ${row('dirty', n(m.dirty) + ' MiB')}
     ${row('shmem', n(m.shmem) + ' MiB')}
     ${spark(m.free_series, 'var(--ser)')}
-    <div class="lbl"><span>free MiB, recent</span><b></b></div>`;
+    <div class="lbl"><span>free MiB, recent</span><b></b></div>
+    </div>`;
 }
 function memExtra(m){ return rest(m, MEM_SHOWN); }
 
@@ -868,21 +899,22 @@ function srvLive(d){
     ${row('prefill t/s', sp(d.pp, d.pp_last, 0, d.why_pp))}
     ${row('TTFT', d.ttft_last === null || d.ttft_last === undefined ? '<span class="dim">—</span>'
         : n(d.ttft_last,2) + ' s' + (d.ttft_n > 1 ? ` <span class="dim">(mean of ${n(d.ttft_n)})</span>` : ''))}
-    ${row('context', `<span class="mono">${E(d.ctx_text)}</span>`)}
+    ${row('context', `<span class="mono">${E(d.ctx_text)}</span>`, 'adv')}
     <div class="lbl"><span>KV cache</span><b>${pc(d.kv_pct)}${
       d.kv_used ? ` · ${n(d.kv_used)} cells` : ''}</b></div>
     ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
     ${row(d.kv_pool ? 'sequences' : 'slots', `${n(d.active)} active / ${n(d.slots)} · ${n(d.queued)} queued`)}
-    ${d.reuse === null || d.reuse === undefined ? '' : row('prompt reuse', pc(d.reuse * 100))}
+    ${d.reuse === null || d.reuse === undefined ? '' : row('prompt reuse', pc(d.reuse * 100), 'adv')}
     ${d.preemptions === null || d.preemptions === undefined ? ''
-      : row('preemptions', d.preemptions > 0 ? `<span class="warn">${n(d.preemptions)}</span>` : n(d.preemptions))}
+      : d.preemptions > 0 ? row('preemptions', `<span class="warn">${n(d.preemptions)}</span>`)
+      : row('preemptions', n(d.preemptions), 'adv')}
     ${row('speculative', d.spec_pct === null || d.spec_pct === undefined
         ? '<span class="dim">—</span>'
         : `${n(d.spec_pct)}% accepted${d.spec_type ? ' · ' + E(d.spec_type) : ''}${
             d.spec_nmax ? ' · n_max ' + n(d.spec_nmax) : ''}`)}
-    ${row('cache hits', n(d.cache_hit))}
-    ${d.decoded === null || d.decoded === undefined ? '' : row('decoded', n(d.decoded) + ' tok')}
-    ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
+    ${row('cache hits', n(d.cache_hit), 'adv')}
+    ${d.decoded === null || d.decoded === undefined ? '' : row('decoded', n(d.decoded) + ' tok', 'adv')}
+    ${row('GPU power attributed', n(d.power_w, 1) + ' W', 'adv')}
     ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
     ${d.slots_off ? row('slots endpoint', '<span class="warn">off</span>') : ''}
     ${d.tg_series && d.tg_series.length > 1
@@ -890,11 +922,11 @@ function srvLive(d){
           d.tg_stats && d.tg_stats.median !== null
             ? `median ${n(d.tg_stats.median,1)} · max ${n(d.tg_stats.max,1)}` : ''}</b></div>` : ''}
     ${d.pp_series && d.pp_series.length > 1
-      ? spark(d.pp_series, 'var(--accent)') + `<div class="lbl"><span>prefill t/s</span><b>${
+      ? A(spark(d.pp_series, 'var(--accent)') + `<div class="lbl"><span>prefill t/s</span><b>${
           d.pp_stats && d.pp_stats.median !== null
-            ? `median ${n(d.pp_stats.median)} · max ${n(d.pp_stats.max)}` : ''}</b></div>` : ''}
+            ? `median ${n(d.pp_stats.median)} · max ${n(d.pp_stats.max)}` : ''}</b></div>`) : ''}
     ${d.kv_series && d.kv_series.length > 1
-      ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}`;
+      ? A(spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>`) : ''}`;
 }
 function srvExtra(d){ return cfgBlock(d.config) + rest(d, SRV_SHOWN); }
 
@@ -967,27 +999,84 @@ function srvVllm(d){
     ${bar(d.kv_pct, d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : '')}
     <div class="big">${genNow} <span>tok/s generated</span></div>
     ${d.tg_series && d.tg_series.length > 1 ? spark(d.tg_series, 'var(--ok)') : ''}
-    ${row('decode ' + (r && r.live ? 'this run' : 'last run'), decode)}
+    ${row('decode ' + (r && r.live ? 'this run' : 'last run'), decode, 'adv')}
     <div class="big">${ppLast} <span>${ppWhat}</span></div>
-    ${d.pp_series && d.pp_series.length > 1 ? spark(d.pp_series, 'var(--accent)') : ''}
-    ${row('prefill ' + (p && p.live ? 'this run' : 'last run'), prefill)}
+    ${d.pp_series && d.pp_series.length > 1 ? A(spark(d.pp_series, 'var(--accent)')) : ''}
+    ${row('prefill ' + (p && p.live ? 'this run' : 'last run'), prefill, 'adv')}
+    ${row('requests', `${n(d.active)} running / ${n(d.slots)} · ${n(d.queued)} waiting`)}
+    ${row('TTFT', `avg ${ms(d.ttft_avg)} · now ${ms(d.ttft_last)}`)}
+    ${row('draft accepted', d.spec_pct == null ? '—'
+        : `${n(d.spec_pct, 1)}%${d.spec_type ? ' · ' + E(d.spec_type) : ''}${d.spec_nmax ? ' · n ' + n(d.spec_nmax) : ''}`)}
+    ${d.preemptions ? row('preemptions', `<span class="warn">${n(d.preemptions)}</span>`) : ''}
+    ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
+    <div class="adv">
     ${row('cache reuse', rr ? `<b class="ok">${n(rr.frac * 100, 1)}%</b> of ${nk(rr.tokens)} prompt tokens · ${ago(rr.at)}`
                             : '<span class="dim">—</span>')}
     ${row('ingest', `${nk(d.ingest)} tok/s`)}
-    ${row('requests', `${n(d.active)} running / ${n(d.slots)} · ${n(d.queued)} waiting`)}
-    ${row('TTFT', `avg ${ms(d.ttft_avg)} · now ${ms(d.ttft_last)}`)}
     ${row('TPOT · e2e', `${ms(d.tpot_avg)} · ${d.e2e_avg == null ? '—' : n(d.e2e_avg, 2) + ' s'}`)}
     ${row('prefix cache (lifetime)', d.reuse == null ? '—' : n(d.reuse * 100, 1) + '%')}
-    ${row('draft accepted', d.spec_pct == null ? '—'
-        : `${n(d.spec_pct, 1)}%${d.spec_type ? ' · ' + E(d.spec_type) : ''}${d.spec_nmax ? ' · n ' + n(d.spec_nmax) : ''}`)}
     ${row('avg prompt · answer', `${nk(d.prompt_avg)} · ${nk(d.answer_avg)} tok`)}
     ${row('since start', `${nk(d.gen_total)} generated · ${nk(d.prompt_total)} prompt · ${nk(d.req_total)} requests`)}
-    ${d.preemptions ? row('preemptions', `<span class="warn">${n(d.preemptions)}</span>`) : ''}
     ${row('GPU power attributed', n(d.power_w, 1) + ' W')}
-    ${d.metrics_off ? row('metrics endpoint', '<span class="warn">off</span>') : ''}
     ${d.kv_series && d.kv_series.length > 1
       ? spark(d.kv_series, 'var(--warn)', 100) + `<div class="lbl"><span>KV %</span><b></b></div>` : ''}
-    ${rad ? radianceRows(d) : ''}`;
+    ${rad ? radianceRows(d) : ''}
+    </div>`;
+}
+
+// ---------------------------------------------------------------- headline strip
+// The numbers the page is opened to check, one tile each, in both views: the busiest
+// server's speed and load, then the cards' totals. A tile's top edge carries its state.
+function primary(ls){
+  const up = ls.filter(d => d.alive);
+  return up.find(d => d.phase === 'generating' || d.phase === 'prefill') || up[0] || ls[0] || null;
+}
+function kpi(k, v, unit, sub, state){
+  const c = {ok:'var(--ok)', warn:'var(--warn)', crit:'var(--crit)', none:'var(--line)'}[state] || 'var(--accent)';
+  return `<div class="kpi" style="--c:${c}"><div class="k">${E(k)}</div>
+    <div class="v num">${v}${unit && v !== '—' ? `<span>${E(unit)}</span>` : ''}</div>
+    <div class="s">${sub || '&nbsp;'}</div></div>`;
+}
+function kpiStrip(s){
+  const t = [], d = primary(s.llamas || []), gs = s.gpus || [];
+  const sum = f => gs.some(g => g[f] != null) ? gs.reduce((a, g) => a + (g[f] || 0), 0) : null;
+  if (d){
+    // an idle server is genuinely at 0 tok/s (the probe says so in why_*); anything else
+    // without a reading stays a dash
+    const rate = (v, why) => v != null ? v : why === 'idle' ? 0 : null;
+    const tg = rate(d.tg, d.why_tg), pp = rate(d.pp, d.why_pp);
+    const ppLast = d.pp_last != null ? d.pp_last : d.prun ? d.prun.p_avg : null;
+    const where = `${E(d.flavor || 'llama.cpp')} :${E(d.port)}`;
+    t.push(kpi('decode', n(tg, 1), 'tok/s', d.tg == null && d.tg_last != null
+      ? `last ${n(d.tg_last, 1)} · ${where}` : where, !d.alive ? 'crit' : tg ? 'ok' : ''));
+    t.push(kpi('prefill', nk(pp), 'tok/s',
+      d.pp == null && ppLast != null ? `last ${nk(ppLast)}` : '', pp ? 'ok' : ''));
+    t.push(kpi('KV cache', n(d.kv_pct, d.kv_pct != null && d.kv_pct < 10 ? 1 : 0), '%',
+      d.kv_used != null && d.kv_cap ? `${nk(d.kv_used)} / ${nk(d.kv_cap)} tok` : '',
+      d.kv_pct == null ? 'none' : d.kv_pct >= 90 ? 'crit' : d.kv_pct >= 75 ? 'warn' : 'ok'));
+    t.push(kpi('requests', `${n(d.active)}<span>/ ${n(d.slots)}</span>`, '',
+      d.queued ? `<span class="warn">${n(d.queued)} waiting</span>` : `${n(d.queued)} waiting`,
+      d.queued ? 'warn' : ''));
+    const ttft = d.ttft_avg != null ? d.ttft_avg : d.ttft_last;
+    t.push(kpi('TTFT', ttft == null ? '—' : nk(ttft * 1000), 'ms', d.ttft_avg != null ? 'average' : 'last request', ''));
+    if (d.spec_pct != null)
+      t.push(kpi('draft accept', n(d.spec_pct, 0), '%', [d.spec_type ? E(d.spec_type) : '',
+        d.tok_step != null ? `${n(d.tok_step, 2)} tok/step` : ''].filter(Boolean).join(' · '), ''));
+  }
+  if (gs.length){
+    // averaged over the cards that report it: a card with no reading is not an idle one
+    const busy = gs.filter(g => g.util != null);
+    const util = busy.length ? busy.reduce((a, g) => a + g.util, 0) / busy.length : null;
+    t.push(kpi('GPU util', n(util), '%', gs.map(g => pc(g.util)).join(' · '),
+      util == null ? 'none' : util >= 95 ? 'crit' : util >= 80 ? 'warn' : 'ok'));
+    const hot = gs.filter(g => g.temp_main != null).sort((a, b) => b.temp_main - a.temp_main)[0];
+    t.push(kpi('hottest GPU', hot ? n(hot.temp_main) : '—', '°C',
+      hot ? `GPU${hot.index}${hot.temp_main_label ? ' ' + E(hot.temp_main_label) : ''}` : '', hot ? hot.temp_state : 'none'));
+    const w = sum('power'), cap = sum('power_cap');
+    t.push(kpi('GPU power', n(w), 'W', cap ? `of ${n(cap)} W cap` : '',
+      w != null && cap && w / cap >= 0.95 ? 'warn' : ''));
+  }
+  return t.join('');
 }
 
 function procTable(ps){
@@ -1043,22 +1132,26 @@ function skeleton(){
   // card into its grid by id, so the two are independent and the render order below
   // can stay grouped by kind.
   b.innerHTML =
+    `<div class="kpis" id="g-kpi"></div>` +
     `<h2>Inference servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
     `<h2>System</h2><div class="grid" id="g-sys"></div>` +
-    `<h2>Processes</h2><div id="g-proc"></div>` +
+    `<div class="adv"><h2>Processes</h2><div id="g-proc"></div>` +
     `<h2>Raw snapshot</h2><details><summary>show full JSON (every collected field)</summary>` +
-    `<pre id="g-raw"></pre></details>`;
+    `<pre id="g-raw"></pre></details></div>`;
   b.dataset.built = '1';
 }
 
-function card(gridId, key){
+// `adv` marks a whole card as Advanced-only; a card's extra section (config, all fields)
+// is always Advanced.
+function card(gridId, key, adv){
   let c = CARDS.get(key);
   if (!c || !c.root.isConnected){
     const root = document.createElement('div');
-    root.className = 'card';
+    root.className = adv ? 'card adv' : 'card';
     const live = document.createElement('div');
     const extra = document.createElement('div');
+    extra.className = 'adv';
     root.append(live, extra);
     $(gridId).append(root);
     c = {root, live, extra};
@@ -1067,9 +1160,9 @@ function card(gridId, key){
   return c;
 }
 
-function mount(gridId, key, liveHtml, extraHtml, seen){
+function mount(gridId, key, liveHtml, extraHtml, seen, adv){
   seen.add(key);
-  const c = card(gridId, key);
+  const c = card(gridId, key, adv);
   paint(c.live, liveHtml);
   paint(c.extra, extraHtml || '');
 }
@@ -1084,6 +1177,11 @@ function render(s){
   $('host').textContent = s.host || '';
   const t = s.host ? 'llamagputop · ' + s.host : 'llamagputop';
   if (document.title !== t) document.title = t;
+  const cu = s.cpu || {}, mu = s.mem || {};
+  $('cpuu').textContent = pc(cu.util);
+  $('cpuu').className = 'num ' + (cu.util_state || '');
+  $('ramu').textContent = pc(mu.used_pct);
+  $('ramu').className = 'num ' + (mu.used_pct == null ? '' : mu.used_pct >= 92 ? 'crit' : mu.used_pct >= 80 ? 'warn' : 'ok');
   $('pwr').textContent = n(s.power && s.power.total_w, 0) + ' W';
   $('wh').textContent = n(s.power && s.power.session_wh, 2) + ' Wh';
   $('up').textContent = dur(s.uptime_s);
@@ -1097,11 +1195,13 @@ function render(s){
   (s.gpus || []).forEach(g => mount('g-gpu', 'gpu' + g.index, gpuLive(g), gpuExtra(g), seen));
   mount('g-sys', 'cpu', cpuLive(s.cpu || {}), cpuExtra(s.cpu || {}), seen);
   mount('g-sys', 'mem', memLive(s.mem || {}), memExtra(s.mem || {}), seen);
-  mount('g-sys', 'disk', diskLive(s.disks), '', seen);
-  mount('g-sys', 'pwr', powerLive(s), '', seen);
+  // the header already carries total power and session energy for the Basic view
+  mount('g-sys', 'disk', diskLive(s.disks), '', seen, true);
+  mount('g-sys', 'pwr', powerLive(s), '', seen, true);
   (s.llamas || []).forEach(d => mount('g-srv', 'srv' + d.port, (d.flavor === 'vLLM' || d.flavor === 'radiance') ? srvVllm(d) : srvLive(d), srvExtra(d), seen));
   prune(seen);
 
+  paint($('g-kpi'), kpiStrip(s));
   paint($('g-proc'), procTable(s.procs));
 
   // textContent on the existing <pre>, so the <details> around it is never
@@ -1115,6 +1215,26 @@ function render(s){
     pre.scrollTop = st;
   }
 }
+
+// Basic shows whether things are working and how fast; Advanced adds every diagnostic row,
+// the disk/power/process/raw sections and each card's config and field dump. Remembered
+// per browser; ?view=advanced in the URL overrides it for a shared link.
+const VIEW_KEY = 'llamagputop.view';
+function setView(v, save){
+  document.body.classList.toggle('basic', v !== 'advanced');
+  document.querySelectorAll('#view button').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.v === v)));
+  if (save) try { localStorage.setItem(VIEW_KEY, v); } catch (e) {}
+}
+let view0 = new URLSearchParams(location.search).get('view');
+if (view0 !== 'basic' && view0 !== 'advanced'){
+  try { view0 = localStorage.getItem(VIEW_KEY); } catch (e) { view0 = null; }
+}
+setView(view0 === 'advanced' ? 'advanced' : 'basic', false);
+$('view').addEventListener('click', e => {
+  const b = e.target.closest('button[data-v]');
+  if (b) setView(b.dataset.v, true);
+});
 
 let fails = 0;
 async function tick(){
