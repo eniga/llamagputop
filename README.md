@@ -282,7 +282,8 @@ against the cap. The header carries CPU and RAM use, box power and session energ
 **Basic / Advanced** toggle. Basic keeps the numbers that say whether serving works and how fast;
 Advanced adds every diagnostic row below, the disk, power, process and raw-JSON sections, and
 each panel's configuration and *all fields*. The choice is remembered per browser, and
-`?view=advanced` opens a link in Advanced. What follows describes the Advanced view.
+`?view=advanced` opens a link in Advanced. A light/dark toggle sits beside it; the page
+follows the system theme until one is picked, and remembers the pick. What follows describes the Advanced view.
 
 The page puts the inference panels first, then a card for each GPU. A GPU card shows its
 utilisation sparkline with min/avg/peak, VRAM, power against the cap, every temperature

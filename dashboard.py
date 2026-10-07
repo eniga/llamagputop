@@ -550,20 +550,38 @@ PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>llamagputop</title>
+<script>
+// Theme before first paint, so a light-mode reader never sees a dark flash: the saved
+// choice, else the system's. The toggle in the header changes and saves it.
+(function(){
+  var t = null;
+  try { t = localStorage.getItem('llamagputop.theme'); } catch (e) {}
+  if (t !== 'light' && t !== 'dark')
+    t = window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  document.documentElement.dataset.theme = t;
+})();
+</script>
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <link rel="apple-touch-icon" href="favicon.svg">
 <style>
 :root{
   --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --line:#2a3340;
   --fg:#e6edf3; --dim:#8b949e; --ok:#3fb950; --warn:#d29922; --crit:#f85149;
-  --accent:#58a6ff; --ser:#39c5cf;
+  --accent:#58a6ff; --ser:#39c5cf; --hdr:rgba(14,17,22,.92);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef1f4; --line:#d0d7de;
+  --fg:#1f2328; --dim:#59636e; --ok:#1a7f37; --warn:#9a6700; --crit:#cf222e;
+  --accent:#0969da; --ser:#1b7c83; --hdr:rgba(246,248,250,.92);
+  color-scheme:light;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
   font:13px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 .num,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   font-variant-numeric:tabular-nums}
-header{position:sticky;top:0;z-index:5;background:rgba(14,17,22,.92);
+header{position:sticky;top:0;z-index:5;background:var(--hdr);
   backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
   padding:10px 16px;display:flex;gap:18px;align-items:baseline;flex-wrap:wrap}
 header h1{margin:0;font-size:15px;font-weight:650;letter-spacing:.2px}
@@ -571,8 +589,8 @@ header .host{color:var(--accent)}
 .stat{color:var(--dim);font-size:12px}
 .stat b{color:var(--fg);font-weight:600}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:5px}
-.live{background:var(--ok);box-shadow:0 0 6px var(--ok)}
-.dead{background:var(--crit);box-shadow:0 0 6px var(--crit)}
+.dot.up{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot.down{background:var(--crit);box-shadow:0 0 6px var(--crit)}
 main{padding:16px;max-width:1600px;margin:0 auto}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);
   margin:22px 0 10px;font-weight:600}
@@ -625,7 +643,10 @@ pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
 .seg button+button{border-left:1px solid var(--line)}
 .seg button:hover{color:var(--fg)}
 .seg button[aria-pressed="true"]{background:var(--panel2);color:var(--fg)}
-.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.seg button:focus-visible,.tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.tbtn{align-self:center;background:transparent;color:var(--dim);border:1px solid var(--line);
+  border-radius:7px;padding:3px 9px;font:inherit;font-size:12px;cursor:pointer}
+.tbtn:hover{color:var(--fg)}
 body.basic .adv{display:none!important}
 .kpis{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:4px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-top:2px solid var(--c,var(--accent));
@@ -637,7 +658,7 @@ body.basic .adv{display:none!important}
 </style></head><body class="basic">
 <header>
   <h1>llamagputop <span class="host" id="host">…</span></h1>
-  <span class="stat"><span class="dot dead" id="dot"></span><span id="conn">connecting</span></span>
+  <span class="stat"><span class="dot down" id="dot"></span><span id="conn">connecting</span></span>
   <span class="stat">CPU <b class="num" id="cpuu">—</b></span>
   <span class="stat">RAM <b class="num" id="ramu">—</b></span>
   <span class="stat">power <b class="num" id="pwr">—</b></span>
@@ -648,6 +669,7 @@ body.basic .adv{display:none!important}
     <button type="button" data-v="basic" aria-pressed="true">Basic</button>
     <button type="button" data-v="advanced" aria-pressed="false">Advanced</button>
   </div>
+  <button type="button" class="tbtn" id="theme"></button>
 </header>
 <main>
   <div id="err"></div>
@@ -1236,6 +1258,21 @@ $('view').addEventListener('click', e => {
   if (b) setView(b.dataset.v, true);
 });
 
+// The head script already applied the saved or system theme; this labels the button with
+// the theme it switches TO, and saves an explicit choice.
+function paintTheme(){
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  $('theme').textContent = next === 'light' ? '☀ Light' : '☾ Dark';
+  $('theme').setAttribute('aria-label', 'switch to ' + next + ' theme');
+}
+paintTheme();
+$('theme').addEventListener('click', () => {
+  const t = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('llamagputop.theme', t); } catch (e) {}
+  paintTheme();
+});
+
 let fails = 0;
 async function tick(){
   try{
@@ -1243,10 +1280,10 @@ async function tick(){
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const s = await r.json();
     fails = 0;
-    $('dot').className = 'dot live';
+    $('dot').className = 'dot up';
     if (!s.ready){
       $('conn').textContent = s.error ? 'collector failed' : (s.message || 'starting');
-      $('dot').className = 'dot dead';
+      $('dot').className = 'dot down';
       if (s.error) $('err').innerHTML = `<div class="banner">${E(s.error)}</div>`;
       return;
     }
@@ -1254,7 +1291,7 @@ async function tick(){
     render(s);
   }catch(e){
     if (++fails > 2){
-      $('dot').className = 'dot dead';
+      $('dot').className = 'dot down';
       $('conn').textContent = 'disconnected';
     }
   }
