@@ -2137,6 +2137,15 @@ class LlamaProbe:
         # because with two the counters advanced for two requests and the sum is not a TTFT.
         self.ttft_last = None
         self._ttft_slots = 0
+        # Request latency for the endpoints table. llama.cpp keeps no latency histogram, so a
+        # request's latency is its prompt seconds plus its predicted seconds, taken on the
+        # tick its counters move and only when at most one slot was working (with two, the
+        # deltas are two requests summed). Server-timed, so queueing is not in it. Averaged
+        # over the requests this process saw, since there is no lifetime figure to read.
+        self.e2e_last = self.e2e_peak = None
+        self._e2e = [0.0, 0]               # sum, count
+        self.reuse_recent = None
+        self._reuse_prev = None            # (cached, new) prompt tokens last tick
         # 6 s of trail at the fastest refresh (0.5 s) needs 13 slots, not 12: the old cap
         # silently shortened the window at the very rate a user picks to watch it closely.
         self._dhist = deque(maxlen=32)       # (time, n_decoded), generation
@@ -2252,7 +2261,18 @@ class LlamaProbe:
              "spec_nmax": None, "spec_stale": False, "cache_hit": 0, "prompt_new": 0,
              "max_tok": None, "reuse": None, "budget": 0, "decoded": 0, "kv_used": 0,
              "metrics_off": False, "slots_off": False, "stale": False, "kv_cap": None,
-             "active_metric": None}
+             "active_metric": None, "e2e_avg": self._e2e_avg(), "e2e_last": self.e2e_last,
+             "e2e_peak": self.e2e_peak, "reuse_recent": self.reuse_recent,
+             "outcomes": None, "resp_rate": None, "cached_total": None}
+
+    def _e2e_avg(self):
+        return self._e2e[0] / self._e2e[1] if self._e2e[1] else None
+
+    def _e2e_add(self, seconds):
+        self.e2e_last = seconds
+        self.e2e_peak = max(self.e2e_peak or 0.0, seconds)
+        self._e2e[0] += seconds
+        self._e2e[1] += 1
 
     def sample(self):
         import json, time
@@ -2304,6 +2324,17 @@ class LlamaProbe:
                 _tot = d["cache_hit"] + d["prompt_new"]
                 d["reuse"] = (d["cache_hit"] / _tot) if (
                     _tot and "llamacpp:prompt_tokens_cached_total" in m) else None
+                # the cached share of the prompts that finished since the last tick that had any
+                if "llamacpp:prompt_tokens_cached_total" in m:
+                    cur = (d["cache_hit"], d["prompt_new"])
+                    pv = self._reuse_prev
+                    if pv and cur[0] >= pv[0] and cur[1] >= pv[1]:
+                        dh, dn = cur[0] - pv[0], cur[1] - pv[1]
+                        if dh + dn > 0:
+                            self.reuse_recent = {"frac": dh / (dh + dn), "tokens": dh + dn,
+                                                 "at": time.time()}
+                    self._reuse_prev = cur
+                d["reuse_recent"] = self.reuse_recent
                 draft = m.get("llamacpp:spec_decode_num_draft_tokens_total", 0)
                 acc = m.get("llamacpp:spec_decode_num_accepted_tokens_total", 0)
                 d["spec_draft"], d["spec_acc"] = draft, acc
@@ -2335,6 +2366,9 @@ class LlamaProbe:
                         self._ttft_slots = len(getattr(self, "_bids", ()) or ())
                     if c[C[2]] - self.cnt[C[2]] > 0 and c[C[3]] - self.cnt[C[3]] > 0:
                         self.tg_last = (c[C[2]] - self.cnt[C[2]]) / (c[C[3]] - self.cnt[C[3]])
+                        if len(getattr(self, "_bids", ()) or ()) <= 1:
+                            self._e2e_add(max(0.0, c[C[1]] - self.cnt[C[1]])
+                                          + (c[C[3]] - self.cnt[C[3]]))
                 self.cnt = c
                 d["pp_life"] = c[C[0]] / c[C[1]] if c[C[1]] else None
                 d["tg_life"] = c[C[2]] / c[C[3]] if c[C[3]] else None
@@ -2456,6 +2490,7 @@ class LlamaProbe:
         d["pp"], d["tg"] = self.pp, self.tg
         d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
         d["ttft_last"], d["ttft_slots"] = self.ttft_last, self._ttft_slots
+        d["e2e_avg"], d["e2e_last"], d["e2e_peak"] = self._e2e_avg(), self.e2e_last, self.e2e_peak
         # reasoning format is in the slot data itself (both old and new builds).
         # Guarded, and the guard was removed once and put back: `x` is seeded to {} above,
         # which covers "/slots failed", but not "/slots answered with a list whose items are
@@ -2531,6 +2566,9 @@ class VllmProbe(LlamaProbe):
     # step; an engine whose compatibility counter only moves when a request finishes
     # names its own per-step counter here (RadianceProbe).
     _GEN_COUNTER = "vllm:generation_tokens_total"
+    # Prompt tokens served from the prefix cache. radiance exports no such vLLM counter and
+    # names its own (RadianceProbe).
+    _CACHED_COUNTER = "vllm:prompt_tokens_cached_total"
 
     def __init__(self, port="8000", host="127.0.0.1"):
         super().__init__(port, host)
@@ -2547,6 +2585,7 @@ class VllmProbe(LlamaProbe):
         self._run_tick = None
         self._pt = None                    # (prompt_tokens, cached, monotonic) last tick
         self.reuse_recent = None
+        self._e2e_prev = None              # e2e latency histogram (sum, count) last tick
 
     def _blank(self):
         d = super()._blank()
@@ -2567,6 +2606,37 @@ class VllmProbe(LlamaProbe):
                 "peak": r["peak"] if r["peak"] else avg,
                 "p_tok": int(r["p_tok"]), "p_time": r["p_time"], "p_avg": p_avg,
                 "p_peak": r["p_peak"], "ended": None if live else time.time()}
+
+    # Responses the server failed on, beyond request_success_total's own `error` reason.
+    _REJECT_COUNTERS = ()
+
+    def _outcomes(self, m):
+        """Finished requests by how they finished, and the response rate: the share of
+        requests the server answered. `abort` is the client hanging up (a stop button, a
+        closed tab), so it is counted and shown but not held against the server. A build
+        that exports no failure reason at all has no response rate: every request it
+        reports is a success by construction, and 100% would be a claim nothing measured."""
+        rows = m.get("vllm:request_success_total")
+        if not rows:
+            return None, None
+        o = {"ok": 0.0, "error": 0.0, "abort": 0.0, "rejected": 0.0}
+        failure_known = False
+        for labels, v in rows:
+            why = labels.get("finished_reason")
+            if why == "error":
+                o["error"] += v
+                failure_known = True
+            elif why == "abort":
+                o["abort"] += v
+            else:
+                o["ok"] += v
+        for name in self._REJECT_COUNTERS:
+            for _labels, v in m.get(name) or ():
+                o["rejected"] += v
+                failure_known = True
+        o = {k: int(v) for k, v in o.items()}
+        answered = o["ok"] + o["error"] + o["rejected"]
+        return o, (o["ok"] / answered if failure_known and answered else None)
 
     def _cmdline(self):
         if self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL:
@@ -2688,11 +2758,26 @@ class VllmProbe(LlamaProbe):
         d["ttft_avg"] = mean("vllm:time_to_first_token_seconds")
         d["tpot_avg"] = mean("vllm:request_time_per_output_token_seconds")
         d["e2e_avg"] = mean("vllm:e2e_request_latency_seconds")
+        # The slowest request: the histogram's buckets only bound it, so the peak is the
+        # mean of the requests that finished in one tick, the highest seen. At one request
+        # per tick that is the request itself. Reset with the server's counters.
+        es, en = tot("vllm:e2e_request_latency_seconds_sum"), tot("vllm:e2e_request_latency_seconds_count")
+        if es is not None and en is not None:
+            pe = self._e2e_prev
+            if pe and en < pe[1]:
+                self.e2e_last = self.e2e_peak = None
+            elif pe and en > pe[1] and es >= pe[0]:
+                self.e2e_last = (es - pe[0]) / (en - pe[1])
+                self.e2e_peak = max(self.e2e_peak or 0.0, self.e2e_last)
+            self._e2e_prev = (es, en)
+        d["e2e_last"], d["e2e_peak"] = self.e2e_last, self.e2e_peak
         d["prompt_avg"] = mean("vllm:request_prompt_tokens")
         d["answer_avg"] = mean("vllm:request_generation_tokens")
-        ptot, pcache = tot("vllm:prompt_tokens_total"), tot("vllm:prompt_tokens_cached_total")
+        ptot, pcache = tot("vllm:prompt_tokens_total"), tot(self._CACHED_COUNTER)
         d["prompt_total"], d["req_total"] = ptot, tot("vllm:request_success_total")
+        d["cached_total"] = pcache
         d["gen_total"] = tot("vllm:generation_tokens_total")
+        d["outcomes"], d["resp_rate"] = self._outcomes(m)
         # Ingest and recent reuse. The prompt counters advance once per request, when its
         # prefill completes (vLLM folds PrefillStats in per request, not per chunk), so
         # ingest is a completion rate over the tick, and reuse is the cached share of the
@@ -2701,7 +2786,8 @@ class VllmProbe(LlamaProbe):
             if self._pt is not None and ptot >= self._pt[0]:
                 dp = ptot - self._pt[0]
                 d["ingest"] = dp / max(now - self._pt[2], 1e-3)
-                if dp > 0:
+                # no cached-token counter is no reuse figure, not a reuse of zero
+                if dp > 0 and pcache is not None:
                     self.reuse_recent = {
                         "frac": max(0.0, (pcache or 0) - (self._pt[1] or 0)) / dp,
                         "tokens": int(dp), "at": time.time()}
@@ -2818,6 +2904,10 @@ class RadianceProbe(VllmProbe):
     KV held for the next turn, the version and the uptime."""
 
     _GEN_COUNTER = "radiance:decode_tokens_total"
+    # prompt tokens whose attention KV came from the prefix cache, against vllm:prompt_tokens_total
+    _CACHED_COUNTER = "radiance:attn_cached_tokens_total"
+    # turned away at the HTTP queue (--queue-cap full) before reaching the engine
+    _REJECT_COUNTERS = ("radiance:http_admission_rejected_total",)
     _STATS_TTL = 2.0
 
     def __init__(self, port="8000", host="127.0.0.1"):
@@ -3033,6 +3123,54 @@ def sample_llama_fleet(explicit_port=None):
     return out
 
 
+def endpoint_row(d):
+    """One server as a row of the endpoints table: is it answering, does it answer
+    requests, how long do they take, how fast is it, and how much of each prompt the cache
+    saved. Every figure keeps the contract: None where nothing measured it, with `why`
+    saying so, and a real zero where one was measured.
+
+    Scopes differ by engine and are reported in the row. vLLM and radiance keep lifetime
+    counters, so their latency average and cache share are since the server started;
+    llama.cpp has neither a latency histogram nor a request-outcome counter, so its
+    latency is over the requests this process watched finish and it has no response rate.
+    The speed avg/max are over this model's generating ticks (or completed prefills) in
+    the recorded history, the same series the server panel's median is drawn from."""
+    port = d.get("port")
+    health = ("offline" if not d.get("alive") else "no answer" if d.get("stale")
+              else "no metrics" if d.get("metrics_off") else "healthy")
+    _lo, tg_avg, tg_max = _extremes(f"tg_gen@{port}")
+    _lo, pp_avg, pp_max = _extremes(f"pp_gen@{port}")
+    live = d.get("alive") and not d.get("stale")
+    tg_live = d.get("tg") if live else None
+    pp_live = d.get("pp") if live else None
+    lifetime = d.get("flavor") in ("vLLM", "radiance")
+    pt, ct = d.get("prompt_total"), d.get("cached_total")
+    if lifetime:
+        cache_avg = min(1.0, ct / pt) if pt and ct is not None else d.get("reuse")
+    else:
+        cache_avg = d.get("reuse")
+    rr = d.get("reuse_recent")
+    o = d.get("outcomes")
+    return {
+        "port": port, "name": f"{d.get('flavor') or 'llama.cpp'} :{port}",
+        "flavor": d.get("flavor") or "llama.cpp", "model": d.get("model") or "",
+        "version": d.get("engine_version"), "health": health, "phase": d.get("phase"),
+        "active": d.get("active"), "queued": d.get("queued"),
+        "resp_rate": d.get("resp_rate"), "outcomes": o,
+        "resp_why": None if d.get("resp_rate") is not None else (
+            "llama.cpp exports no request outcomes" if not lifetime
+            else "no requests yet" if o is not None and not sum(o.values())
+            else "server exports no failure counter" if o is not None
+            else "no request counter"),
+        "lat_avg": d.get("e2e_avg"), "lat_peak": d.get("e2e_peak"), "lat_last": d.get("e2e_last"),
+        "lat_scope": "since server start" if lifetime else "requests seen by llamagputop",
+        "tg": tg_live, "tg_last": d.get("tg_last"), "tg_avg": tg_avg, "tg_max": tg_max,
+        "pp": pp_live, "pp_last": d.get("pp_last"), "pp_avg": pp_avg, "pp_max": pp_max,
+        "cache_recent": rr.get("frac") if rr else None, "cache_recent_at": rr.get("at") if rr else None,
+        "cache_avg": cache_avg,             # every engine's cache counters are since server start
+    }
+
+
 # ------------------------------------------------------------------- --probe
 def probe():
     """Print everything the data layer sees. Used to validate portability without
@@ -3142,6 +3280,10 @@ def _extremes(key):
 import curses
 
 OK = WARN = CRIT = DIM = SER = 0
+# green -> amber -> red for temperatures, filled in when the terminal has 256 colours;
+# without it a temperature falls back to OK / WARN / CRIT on the same scale
+TEMP_RAMP = []
+TEMP_RAMP_256 = (40, 112, 184, 214, 208, 202, 196)   # amber (214) sits at the middle
 BLOCKS = "▏▎▍▌▋▊▉█"
 
 
@@ -3254,21 +3396,40 @@ def _box(w, y, x, width, height, title, note=""):
     _put(w, y + height - 1, x, [("╰" + "─" * (width - 2) + "╯", DIM)], x + width + 1)
 
 
-def _temp_attr(t):
-    return CRIT if (t or 0) >= 90 else WARN if (t or 0) >= 80 else OK
+def _temp_scale(crit=None):
+    """(green, amber, red) points of a sensor's colour scale in °C. Red is 90 °C, or 5 °C
+    under a declared critical limit that is lower (drives); amber is 10 °C under red and
+    green 30 °C under it. The dashboard draws the same scale."""
+    hi = min(90, crit - 5) if crit else 90
+    return hi - 30, hi - 10, hi
+
+
+def _temp_heat(t, crit=None):
+    """Where t sits on its scale: 0 up to green, 0.5 at amber, 1 from red."""
+    lo, mid, hi = _temp_scale(crit)
+    if t <= lo:
+        return 0.0
+    if t >= hi:
+        return 1.0
+    if t < mid:
+        return 0.5 * (t - lo) / (mid - lo)
+    return 0.5 + 0.5 * (t - mid) / (hi - mid)
+
+
+def _temp_attr(t, crit=None):
+    if t is None:
+        return DIM
+    h = _temp_heat(t, crit)
+    if TEMP_RAMP:
+        a = TEMP_RAMP[round(h * (len(TEMP_RAMP) - 1))]
+        return a | curses.A_BOLD if h >= 1 else a
+    return CRIT if h >= 1 else WARN if h >= 0.5 else OK
 
 
 def _temp_attr_th(t, thresholds):
-    """Colour a temperature by the driver-declared critical/emergency points when
-    available, falling back to fixed 80/90°C."""
-    if t is None:
-        return DIM
-    crit, emerg = thresholds or (0, 0)
-    if emerg and t >= emerg:
-        return CRIT
-    if crit and t >= crit:
-        return WARN
-    return _temp_attr(t)
+    """Colour a temperature against the driver-declared (critical, emergency) points:
+    the critical one pulls the red point down when it is below 95 °C."""
+    return _temp_attr(t, (thresholds or (0, 0))[0])
 
 
 def _gtt_status(gtt, vram_free):
@@ -3435,9 +3596,7 @@ def _disk_rows(dk, width):
             b = d["busy"]
             cells.append([("busy ", DIM), (f"{b:.0f}%", WARN if b >= 80 else 0)])
         if d.get("temp") is not None:
-            crit = d.get("temp_crit") or 85
-            c = CRIT if d["temp"] >= crit - 5 else WARN if d["temp"] >= crit - 15 else OK
-            cells.append([(f"{d['temp']}°C", c)])
+            cells.append([(f"{d['temp']}°C", _temp_attr(d["temp"], d.get("temp_crit") or 85))])
         rows += _flow(cells, inner)
     bw = max(8, min(14, inner // 6))
     for f in dk.get("fs") or ():
@@ -4273,6 +4432,11 @@ def _tui(w, gpus, feeds, port):
         OK, WARN = curses.color_pair(1), curses.color_pair(2)
         CRIT = curses.color_pair(3) | curses.A_BOLD
         SER = curses.color_pair(4)
+        if curses.COLORS >= 256 and curses.COLOR_PAIRS > 16 + len(TEMP_RAMP_256):
+            TEMP_RAMP.clear()
+            for i, c in enumerate(TEMP_RAMP_256, 16):
+                curses.init_pair(i, c, -1)
+                TEMP_RAMP.append(curses.color_pair(i))
     else:
         OK, WARN, CRIT, SER = 0, curses.A_BOLD, curses.A_REVERSE, 0
     for f in feeds.values():

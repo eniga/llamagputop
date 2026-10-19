@@ -1468,5 +1468,183 @@ class Disks(Base):
         self.assertEqual(lgt._disk_rows(None, 120), [[("no block devices readable", lgt.DIM)]])
 
 
+class TemperatureColour(unittest.TestCase):
+    """The green -> amber -> red scale shared with the dashboard."""
+
+    def setUp(self):
+        self._attrs = (lgt.OK, lgt.WARN, lgt.CRIT, lgt.DIM, list(lgt.TEMP_RAMP))
+        lgt.OK, lgt.WARN, lgt.CRIT, lgt.DIM = 1, 2, 3, 4
+        lgt.TEMP_RAMP.clear()
+
+    def tearDown(self):
+        lgt.OK, lgt.WARN, lgt.CRIT, lgt.DIM, ramp = self._attrs
+        lgt.TEMP_RAMP[:] = ramp
+
+    def test_scale_defaults_and_declared_limit(self):
+        self.assertEqual(lgt._temp_scale(), (60, 80, 90))
+        # a GPU's 110 °C limit is far above the default, so it does not move the scale
+        self.assertEqual(lgt._temp_scale(110), (60, 80, 90))
+        # a drive's 85 °C limit pulls red to 80, as the old crit-5 / crit-15 rule did
+        self.assertEqual(lgt._temp_scale(85), (50, 70, 80))
+
+    def test_heat_is_continuous_and_clamped(self):
+        h = lgt._temp_heat
+        self.assertEqual((h(20), h(60), h(80), h(90), h(120)), (0.0, 0.0, 0.5, 1.0, 1.0))
+        self.assertAlmostEqual(h(70), 0.25)
+        self.assertAlmostEqual(h(85), 0.75)
+        self.assertLess(h(79), h(81))
+
+    def test_three_colour_fallback_keeps_the_old_thresholds(self):
+        a = lgt._temp_attr
+        self.assertEqual((a(79), a(80), a(89), a(90)), (lgt.OK, lgt.WARN, lgt.WARN, lgt.CRIT))
+        self.assertEqual(a(None), lgt.DIM)
+        self.assertEqual(lgt._temp_attr_th(85, (110, 115)), lgt.WARN)
+        self.assertEqual(lgt._temp_attr_th(85, None), lgt.WARN)
+
+    def test_ramp_runs_green_to_red(self):
+        lgt.TEMP_RAMP[:] = [10, 11, 12, 13, 14, 15, 16]
+        a = lgt._temp_attr
+        self.assertEqual((a(40), a(80)), (10, 13))      # green, amber in the middle
+        self.assertEqual(a(95), 16 | lgt.curses.A_BOLD)  # red, and bold like CRIT
+        steps = [a(t) & ~lgt.curses.A_BOLD for t in range(55, 96)]
+        self.assertEqual(steps, sorted(steps))
+
+
+class EndpointFigures(Base):
+    """What the endpoints table is built from: request outcomes, latency, cache share."""
+
+    def setUp(self):
+        super().setUp()
+        self._time = lgt.time
+        self.clock = FakeClock()
+        lgt.time = self.clock
+        self._hist = dict(lgt.HIST)
+        lgt.HIST.clear()
+
+    def tearDown(self):
+        lgt.time = self._time
+        lgt.HIST.clear()
+        lgt.HIST.update(self._hist)
+        super().tearDown()
+
+    def vllm(self, cls=None):
+        pr = (cls or lgt.VllmProbe)("8000")
+        pr._cmdline = lambda: VllmCommandLine.CMD if cls is None else RadianceCommandLine.CMD
+        pr._STATS_TTL = 0.0
+        pr.body = ""
+        pr._get = lambda path, timeout=2.5: (
+            '{"data":[{"id":"m"}]}' if path == "/v1/models"
+            else "{}" if path == "/stats" else pr.body)
+        return pr
+
+    def tick(self, pr, body):
+        self.clock.t += 1.0
+        pr.body = body
+        return pr.sample()
+
+    @staticmethod
+    def outcomes(**by_reason):
+        L = 'engine="0",model_name="m"'
+        return "".join(f'vllm:request_success_total{{{L},finished_reason="{k}"}} {v}\n'
+                       for k, v in by_reason.items())
+
+    @staticmethod
+    def e2e(s, cnt):
+        L = 'engine="0",model_name="m"'
+        return (f"vllm:e2e_request_latency_seconds_sum{{{L}}} {s}\n"
+                f"vllm:e2e_request_latency_seconds_count{{{L}}} {cnt}\n")
+
+    def test_response_rate_leaves_client_cancels_out(self):
+        pr = self.vllm()
+        s = self.tick(pr, vllm_metrics() + self.outcomes(stop=90, length=5, abort=20, error=5))
+        self.assertEqual(s["outcomes"], {"ok": 95, "error": 5, "abort": 20, "rejected": 0})
+        self.assertAlmostEqual(s["resp_rate"], 0.95)
+
+    def test_no_failure_reason_is_no_response_rate(self):
+        # every request such a build reports succeeded by construction: 100% is not a reading
+        pr = self.vllm()
+        s = self.tick(pr, vllm_metrics() + self.outcomes(stop=10, abort=1))
+        self.assertIsNone(s["resp_rate"])
+        self.assertEqual(lgt.endpoint_row(dict(s, port="8000", flavor="vLLM"))["resp_why"],
+                         "server exports no failure counter")
+
+    def test_zero_errors_is_a_real_hundred_percent(self):
+        pr = self.vllm()
+        s = self.tick(pr, vllm_metrics() + self.outcomes(stop=10, error=0))
+        self.assertEqual(s["resp_rate"], 1.0)
+
+    def test_radiance_counts_admission_rejections_as_failures(self):
+        pr = self.vllm(lgt.RadianceProbe)
+        L = 'model_name="Qwen3.8-Flash-Next",engine="0"'
+        s = self.tick(pr, radiance_metrics() + self.outcomes(stop=8, error=0)
+                      + f"radiance:http_admission_rejected_total{{{L}}} 2\n")
+        self.assertEqual(s["outcomes"]["rejected"], 2)
+        self.assertAlmostEqual(s["resp_rate"], 0.8)
+
+    def test_latency_peak_is_the_slowest_tick(self):
+        pr = self.vllm()
+        self.tick(pr, vllm_metrics() + self.e2e(10.0, 2))
+        s = self.tick(pr, vllm_metrics() + self.e2e(40.0, 3))       # one request, 30 s
+        s = self.tick(pr, vllm_metrics() + self.e2e(46.0, 5))       # two, 3 s each
+        self.assertAlmostEqual(s["e2e_avg"], 46.0 / 5)
+        self.assertAlmostEqual(s["e2e_last"], 3.0)
+        self.assertAlmostEqual(s["e2e_peak"], 30.0)
+        s = self.tick(pr, vllm_metrics() + self.e2e(1.0, 1))        # restarted
+        self.assertIsNone(s["e2e_peak"])
+
+    def test_radiance_cache_share_comes_from_its_attention_counter(self):
+        pr = self.vllm(lgt.RadianceProbe)
+        L = 'model_name="Qwen3.8-Flash-Next",engine="0"'
+        body = lambda p, c: (radiance_metrics() + f"vllm:prompt_tokens_total{{{L}}} {p}\n"
+                             + f"radiance:attn_cached_tokens_total{{{L}}} {c}\n")
+        self.tick(pr, body(1000, 0))
+        s = self.tick(pr, body(5000, 3600))
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.9)
+        row = lgt.endpoint_row(dict(s, port="8080", flavor="radiance"))
+        self.assertAlmostEqual(row["cache_avg"], 0.72)
+        self.assertAlmostEqual(row["cache_recent"], 0.9)
+
+    def test_no_cached_counter_is_no_recent_reuse(self):
+        pr = self.vllm(lgt.RadianceProbe)
+        L = 'model_name="Qwen3.8-Flash-Next",engine="0"'
+        self.tick(pr, radiance_metrics() + f"vllm:prompt_tokens_total{{{L}}} 1000\n")
+        s = self.tick(pr, radiance_metrics() + f"vllm:prompt_tokens_total{{{L}}} 5000\n")
+        self.assertIsNone(s["reuse_recent"])
+
+    def test_llama_latency_is_prompt_plus_predicted_seconds(self):
+        pr = lgt.LlamaProbe("8181")
+        pr.body = ""
+        pr._get = lambda path, timeout=2.5: ("[]" if path == "/slots" else "{}"
+                                             if path == "/props" else pr.body)
+
+        def m(ps, gt, gs, cached, new):
+            return (f"llamacpp:prompt_tokens_total {new}\nllamacpp:prompt_seconds_total {ps}\n"
+                    f"llamacpp:tokens_predicted_total {gt}\n"
+                    f"llamacpp:tokens_predicted_seconds_total {gs}\n"
+                    f"llamacpp:prompt_tokens_cached_total {cached}\n")
+        self.tick(pr, m(0.0, 0, 0.0, 0, 0))
+        s = self.tick(pr, m(0.5, 100, 4.5, 300, 100))
+        self.assertAlmostEqual(s["e2e_last"], 5.0)
+        self.assertAlmostEqual(s["reuse_recent"]["frac"], 0.75)
+        s = self.tick(pr, m(0.5, 100, 4.5, 300, 100))           # nothing finished
+        self.assertAlmostEqual(s["e2e_avg"], 5.0)
+        row = lgt.endpoint_row(dict(s, port="8181", flavor="llama.cpp"))
+        self.assertIsNone(row["resp_rate"])
+        self.assertEqual(row["resp_why"], "llama.cpp exports no request outcomes")
+
+    def test_row_speeds_come_from_the_generating_history(self):
+        for v in (100.0, 300.0):
+            lgt.record("tg_gen@8000", v)
+        row = lgt.endpoint_row({"port": "8000", "flavor": "vLLM", "alive": True,
+                                "tg": 0.0, "phase": "idle"})
+        self.assertEqual((row["tg"], row["tg_avg"], row["tg_max"]), (0.0, 200.0, 300.0))
+        self.assertEqual(row["health"], "healthy")
+        # a silent server keeps its history but has no live rate
+        row = lgt.endpoint_row({"port": "8000", "flavor": "vLLM", "alive": True,
+                                "stale": True, "tg": 50.0})
+        self.assertIsNone(row["tg"])
+        self.assertEqual(row["health"], "no answer")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

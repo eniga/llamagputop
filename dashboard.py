@@ -435,6 +435,7 @@ def build_snapshot(gpus_data, cpu, mem, llamas, cfgs, procs, interval, started):
         "mem": m,
         "disks": san(L._disk.get("last")),
         "llamas": srv,
+        "endpoints": [san(L.endpoint_row(d)) for d in llamas],
         "procs": ps,
         "error": None,
     }
@@ -606,6 +607,14 @@ h2:first-child{margin-top:0}
 .bar>i{display:block;height:100%;background:var(--ok);transition:width .35s ease}
 .bar>i.warn{background:var(--warn)} .bar>i.crit{background:var(--crit)}
 .bar>i.none{background:var(--line)}
+.tbar{position:relative;height:5px;border-radius:3px;overflow:hidden;margin:4px 0 2px}
+.tbar::before,.tbar>i{content:"";position:absolute;inset:0;background:var(--g)}
+.tbar::before{opacity:.18}
+.tbar>i{transition:clip-path .35s ease}
+.chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.chip{border:1px solid var(--line);background:var(--panel2);border-radius:6px;
+  padding:1px 7px;font-size:11px;color:var(--dim)}
+.chip b{font-weight:600}
 .lbl{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);margin-top:7px}
 .lbl b{color:var(--fg);font-weight:600}
 .ok{color:var(--ok)} .warn{color:var(--warn)} .crit{color:var(--crit)}
@@ -655,6 +664,17 @@ body.basic .adv{display:none!important}
 .kpi .v{font-size:24px;font-weight:650;line-height:1.2;margin-top:2px}
 .kpi .v span{font-size:11.5px;font-weight:400;color:var(--dim);margin-left:4px}
 .kpi .s{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ep td{vertical-align:middle;padding:8px 10px}
+.ep th.r,.ep td.r{text-align:right}
+.ep .v{font-weight:650;font-size:13px}
+.ep .s{font-size:11px;color:var(--dim)}
+.ep .hp{display:inline-block;padding:1px 7px;border-radius:5px;font-size:11px;margin-right:8px;
+  border:1px solid currentColor;background:color-mix(in oklab,currentColor 12%,transparent)}
+.ep .hp::before{content:"● ";font-size:9px}
+.ep .meter{display:inline-block;width:64px;height:6px;border-radius:3px;background:var(--panel2);
+  position:relative;vertical-align:middle;margin-right:8px;overflow:hidden}
+.ep .meter>i{position:absolute;inset:0 auto 0 0;background:var(--c,var(--ok))}
+.ep .meter>b{position:absolute;top:-1px;bottom:-1px;width:2px;background:var(--fg)}
 </style></head><body class="basic">
 <header>
   <h1>llamagputop <span class="host" id="host">…</span></h1>
@@ -715,6 +735,40 @@ function spark(arr, color, maxOverride){
     <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.4"
       vector-effect="non-scaling-stroke"/></svg>`;
 }
+// Temperatures fade green -> amber -> red on one scale per sensor: green up to 30 °C below
+// its red point, amber 10 °C below it, red from it. The red point is 90 °C, or 5 °C under
+// the critical limit the driver declares when that is lower (drives); the terminal view
+// uses the same scale. A GPU sensor's limit arrives as [crit, emergency].
+function tempScale(crit){
+  if (Array.isArray(crit)) crit = crit[0];
+  const hi = crit ? Math.min(90, crit - 5) : 90;
+  return [hi - 30, hi - 10, hi];
+}
+function tempColor(t, crit){
+  if (t === null || t === undefined) return 'var(--dim)';
+  const [lo, mid, hi] = tempScale(crit);
+  if (t <= lo) return 'var(--ok)';
+  if (t >= hi) return 'var(--crit)';
+  const [a, b, p] = t < mid ? ['var(--ok)', 'var(--warn)', (t - lo) / (mid - lo)]
+                            : ['var(--warn)', 'var(--crit)', (t - mid) / (hi - mid)];
+  return `color-mix(in oklab, ${b} ${Math.round(p * 100)}%, ${a})`;
+}
+function T(t, crit, unit = ' °C'){
+  return `<span style="color:${tempColor(t, crit)}">${n(t)}${t === null || t === undefined ? '' : unit}</span>`;
+}
+// the scale itself, 20 °C to 10 °C past red, revealed up to the reading
+function tbar(t, crit){
+  if (t === null || t === undefined) return '';
+  const [lo, mid, hi] = tempScale(crit), bot = 20, top = hi + 10;
+  const at = v => Math.max(0, Math.min(100, 100 * (v - bot) / (top - bot)));
+  const g = `linear-gradient(90deg,var(--ok) ${at(lo)}%,var(--warn) ${at(mid)}%,var(--crit) ${at(hi)}%)`;
+  return `<div class="tbar" style="--g:${g}"><i style="clip-path:inset(0 ${(100 - at(t)).toFixed(1)}% 0 0)"></i></div>`;
+}
+function tchips(temps, crits){
+  const e = Object.entries(temps || {}).filter(([, v]) => v !== null && v !== undefined);
+  return e.length ? `<div class="chips">${e.map(([k, v]) =>
+    `<span class="chip">${E(k)} <b>${T(v, (crits || {})[k], '°')}</b></span>`).join('')}</div>` : '';
+}
 function row(k, v, cls){
   return `<div class="row${cls ? ' ' + cls : ''}"><span>${E(k)}</span><span class="num">${v}</span></div>`;
 }
@@ -748,8 +802,7 @@ function link(gts, w, gbs){
 }
 
 function gpuLive(g){
-  const temps = g.temp && Object.keys(g.temp).length
-    ? Object.entries(g.temp).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · ') : null;
+  const crits = g.temp_crit || {}, tcrit = crits[g.temp_main_label];
   // traffic against what the link is currently worth, in the same unit
   const tot = (g.pcie_rx_mbs || 0) + (g.pcie_tx_mbs || 0);
   const cap = g.pcie_gbs ? g.pcie_gbs * 1000 : null;
@@ -772,10 +825,11 @@ function gpuLive(g){
     ${bar(g.vram_pct, g.vram_pct >= 95 ? 'crit' : g.vram_pct >= 85 ? 'warn' : '')}
     <div class="lbl"><span>power</span><b>${n(g.power,1)} / ${n(g.power_cap)} W</b></div>
     ${bar(g.power_pct, g.power_pct >= 95 ? 'warn' : '')}
+    <div class="lbl"><span>${g.temp_main_label ? `temperature (${E(g.temp_main_label)})` : 'temperature'}</span><b>${
+      T(g.temp_main, tcrit)}</b></div>
+    ${tbar(g.temp_main, tcrit)}
+    ${tchips(g.temp, crits)}
     <div style="margin-top:9px">
-      ${row(g.temp_main_label ? `temperature (${g.temp_main_label})` : 'temperature',
-          `<span class="${g.temp_state}">${n(g.temp_main)} °C</span>`)}
-      ${temps ? row('sensors', E(temps), 'adv') : ''}
       ${row('core clock', n(g.sclk) + ' MHz', 'adv')}
       ${row('VRAM free', n(g.vram_free) + ' MiB', 'adv')}
     </div>
@@ -811,13 +865,13 @@ function cpuLive(c){
     <h3>CPU</h3><div class="sub">${E(c.name || '')} · ${n(c.ncpu)} threads</div>
     <div class="lbl"><span>utilisation</span><b class="${c.util_state}">${pc(c.util)}</b></div>
     ${bar(c.util, c.util_state)}
-    ${row('temperature', `<span class="${c.temp_state}">${n(c.temp)} °C</span>`)}
+    <div class="lbl"><span>temperature</span><b>${T(c.temp)}</b></div>
+    ${tbar(c.temp)}
+    ${A(tchips(c.temps))}
     ${row('load average', `<span class="mono">${E(load)}</span>`, 'adv')}
     ${row('frequency', n(c.freq) + ' MHz', 'adv')}
     ${row('package power', c.power === null
         ? '<span class="dim">— RAPL not readable</span>' : n(c.power,1) + ' W', 'adv')}
-    ${c.temps && Object.keys(c.temps).length
-      ? row('sensors', Object.entries(c.temps).map(([k,v]) => `${E(k)} ${n(v)}°`).join(' · '), 'adv') : ''}
     ${A(spark(c.util_series, 'var(--accent)', 100))}`;
 }
 function cpuExtra(c){ return rest(c, CPU_SHOWN); }
@@ -851,12 +905,10 @@ function diskLive(dk){
     return `<h3>Disks</h3><div class="sub">no block devices readable</div>`;
   const gib = b => b == null ? '—' : (b / 1073741824).toFixed(b >= 10 * 1073741824 ? 0 : 1);
   const drives = (dk.disks || []).map(d => {
-    const crit = d.temp_crit || 85;
-    const tcls = d.temp == null ? '' : d.temp >= crit - 5 ? 'crit' : d.temp >= crit - 15 ? 'warn' : 'ok';
     const rate = d.read_mbs == null ? '<span class="dim">rates from the next tick</span>'
       : `r <b>${n(d.read_mbs, 1)}</b> · w <b>${n(d.write_mbs, 1)}</b> MB/s · ${n((d.read_iops || 0) + (d.write_iops || 0))} IOPS`;
     return `<div class="lbl"><span>${E(d.model)} <span class="dim">${gib(d.size)} GiB · ${E(d.name)}</span></span><b>${
-        d.temp == null ? '' : `<span class="${tcls}">${n(d.temp)}°C</span>`}</b></div>
+        d.temp == null ? '' : T(d.temp, d.temp_crit || 85, '°C')}</b></div>
       ${row('I/O', rate)}
       ${d.busy == null ? '' : `<div class="lbl"><span>busy</span><b>${pc(d.busy)}</b></div>${bar(d.busy, d.busy >= 80 ? 'warn' : '')}`}`;
   }).join('');
@@ -1053,8 +1105,8 @@ function primary(ls){
   const up = ls.filter(d => d.alive);
   return up.find(d => d.phase === 'generating' || d.phase === 'prefill') || up[0] || ls[0] || null;
 }
-function kpi(k, v, unit, sub, state){
-  const c = {ok:'var(--ok)', warn:'var(--warn)', crit:'var(--crit)', none:'var(--line)'}[state] || 'var(--accent)';
+function kpi(k, v, unit, sub, state, color){
+  const c = color || {ok:'var(--ok)', warn:'var(--warn)', crit:'var(--crit)', none:'var(--line)'}[state] || 'var(--accent)';
   return `<div class="kpi" style="--c:${c}"><div class="k">${E(k)}</div>
     <div class="v num">${v}${unit && v !== '—' ? `<span>${E(unit)}</span>` : ''}</div>
     <div class="s">${sub || '&nbsp;'}</div></div>`;
@@ -1092,13 +1144,74 @@ function kpiStrip(s){
     t.push(kpi('GPU util', n(util), '%', gs.map(g => pc(g.util)).join(' · '),
       util == null ? 'none' : util >= 95 ? 'crit' : util >= 80 ? 'warn' : 'ok'));
     const hot = gs.filter(g => g.temp_main != null).sort((a, b) => b.temp_main - a.temp_main)[0];
-    t.push(kpi('hottest GPU', hot ? n(hot.temp_main) : '—', '°C',
-      hot ? `GPU${hot.index}${hot.temp_main_label ? ' ' + E(hot.temp_main_label) : ''}` : '', hot ? hot.temp_state : 'none'));
+    const hotCrit = hot ? (hot.temp_crit || {})[hot.temp_main_label] : null;
+    // a <b>, since the tile styles any <span> in its value as the unit
+    t.push(kpi('hottest GPU', hot ? `<b style="font-weight:inherit;color:${
+      tempColor(hot.temp_main, hotCrit)}">${n(hot.temp_main)}</b>` : '—', '°C',
+      hot ? `GPU${hot.index}${hot.temp_main_label ? ' ' + E(hot.temp_main_label) : ''}` : '', 'none',
+      hot ? tempColor(hot.temp_main, hotCrit) : null));
     const w = sum('power'), cap = sum('power_cap');
     t.push(kpi('GPU power', n(w), 'W', cap ? `of ${n(cap)} W cap` : '',
       w != null && cap && w / cap >= 0.95 ? 'warn' : ''));
   }
   return t.join('');
+}
+
+// ---------------------------------------------------------------- endpoints table
+// One row per server, the at-a-glance view: answering, answering requests, how long they
+// take, how fast, and how much of each prompt the cache saved. A big figure is the latest
+// reading; the line under it is the spread. Where nothing measured a figure the cell is a
+// dash, and hovering it says why.
+const secs = v => v == null ? '—' : v < 10 ? n(v, 2) + 's' : n(v, 1) + 's';
+function meter(frac, color, mark){
+  if (frac == null) return '<span class="meter"></span>';
+  const w = Math.max(0, Math.min(1, frac)) * 100;
+  const m = mark == null ? '' : `<b style="left:calc(${(Math.max(0, Math.min(1, mark)) * 100).toFixed(1)}% - 1px)"></b>`;
+  return `<span class="meter" style="--c:${color}"><i style="width:${w.toFixed(1)}%"></i>${m}</span>`;
+}
+function epRate(live, last, avg, max, dec){
+  const f = v => dec ? n(v, dec) : nk(v);
+  const big = live != null ? `${f(live)} <span class="s">tok/s</span>`
+    : last != null ? `<span class="dim">${f(last)}</span> <span class="s">last</span>` : '<span class="dim">—</span>';
+  const sub = avg != null ? `avg ${f(avg)} · max ${f(max)}` : '';
+  return `<div class="v num">${big}</div><div class="s num">${sub || '&nbsp;'}</div>`;
+}
+function endpointTable(eps){
+  if (!eps || !eps.length) return '<div class="empty">No inference servers found.</div>';
+  const hcol = {healthy: 'var(--ok)', 'no answer': 'var(--warn)', 'no metrics': 'var(--warn)', offline: 'var(--crit)'};
+  const rows = eps.map(e => {
+    const o = e.outcomes || {};
+    const rate = e.resp_rate == null
+      ? `<span class="meter"></span><span class="dim" title="${E(e.resp_why || '')}">—</span>`
+      : (() => {
+          const p = e.resp_rate * 100, c = p >= 99 ? 'var(--ok)' : p >= 95 ? 'var(--warn)' : 'var(--crit)';
+          const tip = `${nk(o.ok)} answered · ${nk(o.error)} errors · ${nk(o.rejected)} rejected · ${nk(o.abort)} cancelled by the client`;
+          return `${meter(e.resp_rate, c)}<span class="num" title="${E(tip)}">${n(p, p >= 99.95 ? 0 : 1)}%</span>`;
+        })();
+    const lat = e.lat_avg == null ? `<span class="meter"></span><span class="dim" title="no finished request yet">—</span>`
+      : `${meter(e.lat_peak ? e.lat_avg / e.lat_peak : null, 'var(--accent)',
+                 e.lat_peak && e.lat_last != null ? e.lat_last / e.lat_peak : null)}` +
+        `<span class="num" title="average ${E(e.lat_scope)}; peak is the slowest tick seen; marker is the last request">${
+          secs(e.lat_avg)} <span class="dim">/ ${secs(e.lat_peak)} pk</span></span>`;
+    const cache = e.cache_recent == null && e.cache_avg == null ? '<span class="dim">—</span>'
+      : `<div class="v num" title="${e.cache_recent_at ? 'last prompts, ' + ago(e.cache_recent_at) : ''}">${
+          e.cache_recent == null ? '<span class="dim">—</span>' : n(e.cache_recent * 100, 1) + '%'}</div>` +
+        `<div class="s num" title="since server start">${e.cache_avg == null ? '&nbsp;' : 'avg ' + n(e.cache_avg * 100, 1) + '%'}</div>`;
+    const busy = e.phase === 'generating' || e.phase === 'prefill';
+    return `<tr>
+      <td><span class="hp" style="color:${hcol[e.health] || 'var(--dim)'}">${E(e.health)}</span><b>${E(e.name)}</b>
+        <div class="s">${E(e.model || 'no model')}${busy ? ` · <span class="acc">${E(e.phase)}</span>` : ''}</div></td>
+      <td>${E(e.flavor)}<div class="s">${e.version ? E(e.version) + ' · ' : ''}${n(e.active)} running · ${n(e.queued)} waiting</div></td>
+      <td>${rate}</td>
+      <td>${lat}</td>
+      <td class="r">${epRate(e.tg, e.tg_last, e.tg_avg, e.tg_max, 1)}</td>
+      <td class="r">${epRate(e.pp, e.pp_last, e.pp_avg, e.pp_max, 0)}</td>
+      <td class="r">${cache}</td></tr>`;
+  }).join('');
+  return `<div class="card"><div class="wrap"><table class="ep">
+    <tr><th>endpoint</th><th>type</th><th>resp. rate</th><th>latency</th>
+        <th class="r">generation tok/s</th><th class="r">prefill tok/s</th><th class="r">prompt-cache hit</th></tr>
+    ${rows}</table></div></div>`;
 }
 
 function procTable(ps){
@@ -1155,6 +1268,7 @@ function skeleton(){
   // can stay grouped by kind.
   b.innerHTML =
     `<div class="kpis" id="g-kpi"></div>` +
+    `<h2>Endpoints</h2><div id="g-ep"></div>` +
     `<h2>Inference servers</h2><div class="grid" id="g-srv"></div>` +
     `<h2>GPUs</h2><div class="grid" id="g-gpu"></div>` +
     `<h2>System</h2><div class="grid" id="g-sys"></div>` +
@@ -1224,6 +1338,7 @@ function render(s){
   prune(seen);
 
   paint($('g-kpi'), kpiStrip(s));
+  paint($('g-ep'), endpointTable(s.endpoints));
   paint($('g-proc'), procTable(s.procs));
 
   // textContent on the existing <pre>, so the <details> around it is never
