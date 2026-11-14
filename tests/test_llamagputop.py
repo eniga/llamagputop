@@ -1345,6 +1345,206 @@ class RadianceProbeRates(Base):
             lgt._probes.clear(); lgt._probes.update(saved[2])
 
 
+# The household fleet file of a radiance 2 server, trimmed: the shape that matters is all
+# here (server:, defaults:, entries with their own keys, a quoted value, comments).
+RADIANCE2_YAML = """\
+# Radiance 2 fleet
+server:
+  host: "::"
+  port: 8080
+  api-key-env: RADIANCE_API_KEY
+memory:
+  gpu-headroom-mib: 160
+defaults:
+  p2p: "off"            # no peer access on this board
+  kv-cache-dtype: i8
+models:
+  Qwen3.8-Flash-Next:
+    model: /models/qwen3.8-next-flash-iqr-v4.rad
+    tp: 2
+    tp-wire: wht6
+    max-num-seqs: 8
+    max-model-len: 200000
+    num-speculative-tokens: 3
+    priority: 0
+  Qwen3.8-27B:
+    model: /models/qwen3.8-27b-iq8r-dflash.rad
+    tp: 2
+    kv-cache-dtype: bf16
+    max-model-len: 131072
+    pin: false
+    aliases: [q27, small]
+"""
+
+
+class Radiance2Config(Base):
+    """A radiance 2 server: one process, a YAML file instead of flags, several models."""
+
+    def write_cfg(self, text=RADIANCE2_YAML):
+        path = os.path.join(self.root, "radiance.yaml")
+        with open(path, "w") as f:
+            f.write(text)
+        lgt._RADIANCE_CFG_CACHE.clear()
+        return path
+
+    def test_the_config_flag_alone_marks_the_server(self):
+        self.assertTrue(lgt._is_radiance("radiance", ["radiance", "--config", "/etc/radiance/radiance.yaml"]))
+        self.assertFalse(lgt._is_radiance("docker-init", ["/sbin/docker-init", "--", "radiance", "--config", "x"]))
+
+    def test_mini_yaml_reads_the_fleet_file(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+        self.assertEqual(cfg["server"], {"host": "::", "port": 8080, "api-key-env": "RADIANCE_API_KEY"})
+        self.assertEqual(cfg["defaults"]["p2p"], "off")         # quoted, comment dropped
+        self.assertEqual(list(cfg["models"]), ["Qwen3.8-Flash-Next", "Qwen3.8-27B"])
+        self.assertEqual(cfg["models"]["Qwen3.8-27B"]["aliases"], ["q27", "small"])
+
+    def test_mini_yaml_keeps_zero_and_false_and_leaves_empty_as_none(self):
+        cfg = lgt._mini_yaml("a: 0\nb: false\nc:\nd: ~\n")
+        self.assertEqual((cfg["a"], cfg["b"]), (0, False))
+        self.assertIsNone(cfg["c"])
+        self.assertIsNone(cfg["d"])
+        self.assertEqual(lgt._mini_yaml(""), {})
+
+    def test_server_entry_comes_from_the_file(self):
+        path = self.write_cfg()
+        srv = lgt.radiance_from_cmd(["radiance", "--config", path])
+        self.assertEqual((srv["port"], srv["host"], srv["kind"]), ("8080", "127.0.0.1", "radiance"))
+        self.assertEqual(srv["model_hint"], "Qwen3.8-Flash-Next, Qwen3.8-27B")
+
+    def test_an_unreadable_file_is_the_default_port_and_no_hint(self):
+        srv = lgt.radiance_from_cmd(["radiance", "--config", os.path.join(self.root, "missing.yaml")])
+        self.assertEqual((srv["port"], srv["model_hint"]), ("8000", ""))
+
+    def test_argv_merges_the_entry_over_defaults(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+        flags = dict(lgt._parse_cmdline_flags(lgt.radiance_argv_from_config(cfg, "Qwen3.8-27B")))
+        self.assertEqual(flags["--kv-cache-dtype"], "bf16")     # the entry's own key wins
+        self.assertEqual(flags["--p2p"], "off")                 # the default fills in
+        self.assertEqual(flags["--served-model-name"], "Qwen3.8-27B")
+        self.assertEqual((flags["--port"], flags["--host"]), ("8080", "::"))
+        self.assertEqual(flags["--aliases"], "q27,small")
+
+    def test_argv_keeps_zero_and_drops_a_switch_turned_off(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+        flash = dict(lgt._parse_cmdline_flags(lgt.radiance_argv_from_config(cfg, "Qwen3.8-Flash-Next")))
+        self.assertEqual(flash["--priority"], "0")
+        small = dict(lgt._parse_cmdline_flags(lgt.radiance_argv_from_config(cfg, "Qwen3.8-27B")))
+        self.assertNotIn("--pin", small)
+
+    def test_argv_for_an_unknown_or_no_model_is_the_first_entry(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+        for m in (None, "nope"):
+            flags = dict(lgt._parse_cmdline_flags(lgt.radiance_argv_from_config(cfg, m)))
+            self.assertEqual(flags["--served-model-name"], "Qwen3.8-Flash-Next")
+        self.assertEqual(lgt.radiance_argv_from_config({}, None), [])
+
+    def test_context_speculation_and_panel_read_the_synthesized_line(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+        argv = lgt.radiance_argv_from_config(cfg, "Qwen3.8-Flash-Next")
+        self.assertEqual(lgt.radiance_spec_from_cmd(argv), ("mtp", "in container", "3"))
+        panel = dict((g, dict(rows)) for g, rows in
+                     lgt.settings_from_cmd(argv, lgt._RADIANCE_FLAG_GROUPS).items())
+        self.assertEqual(panel["parallel"]["p2p"], "off")
+        self.assertEqual(panel["fleet"]["priority"], "0")
+        self.assertNotIn("other", panel)
+
+    def test_api_key_literal_masked_and_env_key_absent_without_a_process(self):
+        cfg = lgt._mini_yaml(RADIANCE2_YAML.replace("api-key-env: RADIANCE_API_KEY", "api-key: s3cret"))
+        argv = lgt.radiance_argv_from_config(cfg)
+        self.assertIn("--api-key=s3cret", argv)
+        panel = dict((g, dict(rows)) for g, rows in
+                     lgt.settings_from_cmd(argv, lgt._RADIANCE_FLAG_GROUPS).items())
+        self.assertNotIn("s3cret", panel["server"]["api-key"])
+        # api-key-env with no process to read the environment of: no key, not an empty one
+        self.assertIsNone(lgt._radiance_api_key("?", lgt._mini_yaml(RADIANCE2_YAML)))
+
+    def test_fleet_states_from_health(self):
+        self.assertEqual(lgt._radiance_fleet_states('{"status":"ok","models":{"A":"resident","B":"parked"}}'),
+                         {"A": "resident", "B": "parked"})
+        # a 1.x body has no per-model states: None, not an empty fleet
+        self.assertIsNone(lgt._radiance_fleet_states('{"status":"ok","model":"A","in_flight":0}'))
+        self.assertIsNone(lgt._radiance_fleet_states("not json"))
+
+
+class Radiance2Probe(Base):
+    """The probe against a scripted radiance 2 server: several entries, one resident."""
+
+    def setUp(self):
+        super().setUp()
+        self._time = lgt.time
+        self.clock = FakeClock()
+        lgt.time = self.clock
+        self.pr = lgt.RadianceProbe("8080")
+        self.pr._STATS_TTL = 0.0
+        self.pr._MODEL_TTL = 0.0
+        self.argv_for = []
+        cfg = lgt._mini_yaml(RADIANCE2_YAML)
+
+        def cmdline():
+            self.argv_for.append(self.pr.entry)
+            return lgt.radiance_argv_from_config(cfg, self.pr.entry)
+        self.pr._cmdline = cmdline
+        self.models = [{"id": "Qwen3.8-Flash-Next", "state": "parked", "max_model_len": 200000},
+                       {"id": "Qwen3.8-27B", "state": "resident", "max_model_len": 131072}]
+        self.paths = []
+
+        def get(path, timeout=2.5):
+            self.paths.append(path)
+            if path == "/v1/models":
+                return json.dumps({"data": self.models})
+            if path.startswith("/stats"):
+                if "?model=" not in path:
+                    return '{"error":{"message":"this server serves several models"}}'
+                return RADIANCE_STATS
+            return radiance_metrics()
+        self.pr._get = get
+
+    def tearDown(self):
+        lgt.time = self._time
+        super().tearDown()
+
+    def tick(self):
+        self.clock.t += 1.0
+        return self.pr.sample()
+
+    def test_the_panel_follows_the_resident_entry(self):
+        s = self.tick()
+        self.assertEqual((s["model"], s["ctx"]), ("Qwen3.8-27B", 131072))
+        self.assertEqual(s["fleet"], {"Qwen3.8-Flash-Next": "parked", "Qwen3.8-27B": "resident"})
+        self.assertIn("Qwen3.8-27B", self.argv_for)
+
+    def test_a_swap_is_followed(self):
+        self.tick()
+        self.models[0]["state"], self.models[1]["state"] = "resident", "parked"
+        s = self.tick()
+        self.assertEqual((s["model"], s["ctx"], s["slots"]), ("Qwen3.8-Flash-Next", 200000, 8))
+
+    def test_stats_are_asked_per_model(self):
+        s = self.tick()
+        self.assertIn("/stats?model=Qwen3.8-27B", self.paths)
+        self.assertEqual(s["engine_version"], "1.0.6")
+
+    def test_nothing_resident_is_the_first_entry_not_a_parked_name(self):
+        for m in self.models:
+            m["state"] = "parked"
+        self.models[1]["state"] = "loading"
+        self.assertEqual(self.tick()["model"], "Qwen3.8-27B")       # loading is next to serve
+        self.models[1]["state"] = "cold"
+        self.assertEqual(self.tick()["model"], "Qwen3.8-Flash-Next")
+
+    def test_two_resident_entries_are_both_named(self):
+        self.models[0]["state"] = "resident"
+        s = self.tick()
+        self.assertEqual(s["model"], "Qwen3.8-Flash-Next + Qwen3.8-27B")
+        self.assertEqual(self.pr.entry, "Qwen3.8-Flash-Next")
+
+    def test_a_one_model_server_has_no_fleet(self):
+        self.models[:] = [{"id": "Qwen3.8-Flash-Next"}]
+        s = self.tick()
+        self.assertIsNone(s["fleet"])
+        self.assertIn("/stats", self.paths)
+
+
 class Disks(Base):
     """disk_sample() against a fake /sys/block + /sys/class/block + /proc tree."""
 

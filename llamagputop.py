@@ -1410,23 +1410,233 @@ def discover_vllm_servers():
 def _is_radiance(comm, cmd):
     """The radiance server process. In a container the host's process list also carries
     the init wrapper (`docker-init -- radiance --model ...`), whose command line looks
-    the same but whose name is not `radiance`, so the name decides."""
-    return comm == "radiance" and "--model" in cmd
+    the same but whose name is not `radiance`, so the name decides. Radiance 1.x was
+    started with its model on the command line (`--model`); 2.0 takes nothing but a YAML
+    file (`--config`, "the server binary takes no other flags", docs/MULTIMODEL.md 4.1),
+    so either one marks the server. Without the second half a 2.0 server dropped out of
+    discovery entirely: no panel, no endpoint row, and nothing on screen saying why."""
+    return comm == "radiance" and ("--model" in cmd or "--config" in cmd)
+
+
+def _yaml_scalar(tok):
+    """One YAML scalar, the way radiance's own loader reads the plain ones: quotes
+    stripped, true/false as booleans, integers and floats as numbers, `null`/`~`/empty
+    as None (absent, not zero), everything else verbatim. Flow sequences `[a, b]` become
+    lists; a flow mapping `{...}` stays its text, since nothing here reads inside one
+    (the fleet keys `flex` and `park` are shown as written)."""
+    t = tok.strip()
+    if t in ("", "~", "null", "Null", "NULL"):
+        return None
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        return t[1:-1]
+    if t in ("true", "True", "TRUE"):
+        return True
+    if t in ("false", "False", "FALSE"):
+        return False
+    if t.startswith("[") and t.endswith("]"):
+        inner = t[1:-1].strip()
+        return [_yaml_scalar(x) for x in inner.split(",")] if inner else []
+    for conv in (int, float):
+        try:
+            return conv(t)
+        except ValueError:
+            pass
+    return t
+
+
+def _yaml_strip_comment(line):
+    """The line without a trailing `# comment`. A `#` inside quotes is text, and so is one
+    not preceded by whitespace (`a#b` is a plain scalar in YAML), so only ` #` outside
+    quotes starts a comment."""
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+            return line[:i]
+    return line
+
+
+def _mini_yaml(text):
+    """The block-mapping subset of YAML that a radiance configuration is written in, read
+    with the standard library only (the program's rule: no dependencies, so no PyYAML).
+
+    Supported: nested `key: value` mappings by indentation, comments, quoted and plain
+    scalars, flow lists, and `- item` sequences of scalars. Not supported, and not used by
+    radiance's configuration: anchors, multi-line strings, block sequences of mappings.
+    A line this reader does not understand is skipped rather than guessed at, so a
+    configuration that uses something exotic loses that one key, never the server.
+    Returns {} for unreadable text, which callers treat as "nothing known"."""
+    root = {}
+    stack = [(-1, root)]                   # (indent, container)
+    pending = None                         # (indent, parent dict, key) awaiting a block
+    for raw in (text or "").splitlines():
+        line = _yaml_strip_comment(raw).rstrip()
+        if not line.strip() or line.lstrip().startswith(("---", "...")):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        body = line.strip()
+        if pending is not None:
+            p_indent, p_parent, p_key = pending
+            pending = None
+            if indent > p_indent:
+                child = [] if body.startswith("- ") or body == "-" else {}
+                p_parent[p_key] = child
+                stack.append((p_indent, child))
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        cont = stack[-1][1]
+        if body.startswith("- ") or body == "-":
+            if isinstance(cont, list):
+                cont.append(_yaml_scalar(body[1:]))
+            continue
+        if not isinstance(cont, dict):
+            continue
+        key, sep, val = body.partition(":")
+        if not sep or (val and not val.startswith((" ", "\t"))):
+            continue                       # not `key: value` (a URL-ish scalar, say)
+        key = _yaml_scalar(key)
+        if not isinstance(key, str):
+            key = str(key)
+        if val.strip() == "":
+            cont[key] = None               # a block follows, or the value is empty
+            pending = (indent, cont, key)
+        else:
+            cont[key] = _yaml_scalar(val)
+    return root
+
+
+_RADIANCE_CFG_CACHE = {}
+_RADIANCE_CFG_TTL = 10.0
+
+
+def _radiance_config(pid, cmd):
+    """The parsed YAML configuration a radiance 2 server was started with, or {} for a 1.x
+    server (no --config) and for a file that cannot be read.
+
+    The path on the command line is the CONTAINER's path (/etc/radiance/radiance.yaml
+    under the published compose files). From the host that file is reachable through
+    /proc/<pid>/root, the process's own root, which works for the same user that can
+    already read its cmdline (radiance runs as the host user under its compose files).
+    The bare path is the fallback for a server run straight on the host.
+
+    Cached per pid for a few seconds: the panel asks several times a tick, and a SIGHUP
+    reload changes the file, which a short TTL picks up without a restart here."""
+    flags = dict(_parse_cmdline_flags(cmd or []))
+    path = flags.get("--config")
+    if not isinstance(path, str):
+        return {}
+    key = (str(pid), path)
+    hit = _RADIANCE_CFG_CACHE.get(key)
+    if hit and time.monotonic() - hit[1] < _RADIANCE_CFG_TTL:
+        return hit[0]
+    text = None
+    for cand in ((f"/proc/{pid}/root{path}",) if str(pid).isdigit() else ()) + (path,):
+        text = read(cand, None)
+        if text:
+            break
+    cfg = _mini_yaml(text) if text else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    # A miss is not cached, for the reason api_key_for gives: a server mid-restart.
+    if cfg:
+        _RADIANCE_CFG_CACHE[key] = (cfg, time.monotonic())
+    return cfg
+
+
+def _radiance_models(cfg):
+    """The configuration's model entries, in file order: {name: merged keys}, each entry's
+    own keys over `defaults:` (the merge radiance documents, "a model's own keys win")."""
+    models = cfg.get("models") if isinstance(cfg, dict) else None
+    if not isinstance(models, dict):
+        return {}
+    base = cfg.get("defaults") if isinstance(cfg.get("defaults"), dict) else {}
+    return {name: {**base, **(entry if isinstance(entry, dict) else {})}
+            for name, entry in models.items()}
+
+
+def _radiance_api_key(pid, cfg):
+    """The API key a radiance 2 server checks: `server.api-key` when the file carries it,
+    else the environment variable `server.api-key-env` names, read from the process's own
+    environment (the published compose files pass the key that way precisely so it is not
+    written into the configuration). None when neither can be read."""
+    srv = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+    if isinstance(srv.get("api-key"), str):
+        return srv["api-key"]
+    var = srv.get("api-key-env")
+    if isinstance(var, str) and str(pid).isdigit():
+        for kv in (read(f"/proc/{pid}/environ", "") or "").split("\x00"):
+            name, sep, val = kv.partition("=")
+            if sep and name == var:
+                return val
+    return None
+
+
+def radiance_argv_from_config(cfg, model=None, pid="?"):
+    """A radiance 2 configuration as the radiance 1.x command line it replaces, for one
+    model: `--host`/`--port`/`--api-key` from `server:`, and every key of the chosen entry
+    (over `defaults:`) as `--key=value`, which is literally the 2.0 rule ("every former flag
+    is a YAML key with the same name and no leading dashes"). The entry name goes in as
+    --served-model-name, since 2.0 dropped that flag and made the name the model id.
+
+    Everything downstream that reads a radiance command line (the config panel's groups,
+    the context, the speculation depth, the API key) then works unchanged for both major
+    versions, instead of growing a second reader per field.
+
+    `model` picks the entry; None, or a name the file does not have, takes the first one.
+    Returns [] when the configuration names no models."""
+    models = _radiance_models(cfg)
+    if not models:
+        return []
+    name = model if model in models else next(iter(models))
+    srv = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+    argv = ["radiance"]
+    if srv.get("host") is not None:
+        argv.append(f"--host={srv['host']}")
+    argv.append(f"--port={srv.get('port') if srv.get('port') is not None else 8000}")
+    key = _radiance_api_key(pid, cfg)
+    if key is not None:
+        argv.append(f"--api-key={key}")
+    argv.append(f"--served-model-name={name}")
+    for k, v in models[name].items():
+        if v is None or v is False:
+            continue                       # unset, or a switch turned off: not on a command line
+        if v is True:
+            argv.append(f"--{k}")
+        elif isinstance(v, list):
+            argv.append(f"--{k}={','.join(str(x) for x in v)}")
+        else:
+            argv.append(f"--{k}={v}")
+    return argv
 
 
 def radiance_from_cmd(cmd, pid="?"):
     """Server entry for a radiance command line. radiance's default port is 8000 like
     vLLM's; `--host ::` is how the published compose files bind both stacks, and is
     probed on loopback. The model is a .rad container path unless --served-model-name
-    renames it, which is what /v1/models and the metrics then report."""
+    renames it, which is what /v1/models and the metrics then report.
+
+    A radiance 2 server (`--config`) is one process serving several models; its port and
+    host come from the configuration's `server:` section, and the hint lists every entry,
+    since which of them is on the cards is a live fact the probe reads, not a launch one."""
     flags = dict(_parse_cmdline_flags(cmd))
+    hint = None
+    if "--model" not in flags and isinstance(flags.get("--config"), str):
+        cfg = _radiance_config(pid, cmd)
+        srv = cfg.get("server") if isinstance(cfg.get("server"), dict) else {}
+        flags = {"--port": srv.get("port"), "--host": srv.get("host")}
+        hint = ", ".join(_radiance_models(cfg))
     port = str(flags.get("--port") or "8000")
     host = flags.get("--host")
     host = "127.0.0.1" if (not isinstance(host, str) or host in ("0.0.0.0", "::", "[::]")) else host
-    model = flags.get("--served-model-name") or flags.get("--model")
-    model = os.path.basename(model.rstrip("/")).replace(".rad", "") if isinstance(model, str) else ""
+    if hint is None:
+        model = flags.get("--served-model-name") or flags.get("--model")
+        hint = os.path.basename(model.rstrip("/")).replace(".rad", "") if isinstance(model, str) else ""
     return {"pid": str(pid), "port": port, "host": host, "flavor": "radiance",
-            "kind": "radiance", "model_hint": model}
+            "kind": "radiance", "model_hint": hint}
 
 
 def _radiance_procs():
@@ -1451,11 +1661,59 @@ def discover_radiance_servers():
     return out
 
 
-def _radiance_cmd_for_port(port):
-    for _pid, cmd in _radiance_procs():
-        if radiance_from_cmd(cmd)["port"] == str(port):
+def _radiance_cmd_for_port(port, model=None):
+    """The command line of the radiance server on `port`. For a 2.0 server that is the
+    equivalent 1.x command line of one of its models (radiance_argv_from_config): `model`
+    when the caller knows which one is on the cards (the probe does), else the one
+    resident right now by its unauthenticated /health, else the file's first entry."""
+    for pid, cmd in _radiance_procs():
+        if radiance_from_cmd(cmd, pid)["port"] != str(port):
+            continue
+        if "--model" in cmd or "--config" not in cmd:
             return cmd
+        cfg = _radiance_config(pid, cmd)
+        if model is None:
+            srv = radiance_from_cmd(cmd, pid)
+            resident = _radiance_resident(srv["host"], srv["port"])
+            model = resident[0] if resident else None
+        return radiance_argv_from_config(cfg, model, pid) or cmd
     return None
+
+
+_RADIANCE_HEALTH_CACHE = {}
+_RADIANCE_HEALTH_TTL = 3.0
+
+
+def _radiance_fleet_states(health):
+    """{model: state} from a radiance 2 /health body ({"models": {...}}), or None for a
+    1.x body (one model, no states) and for anything unreadable."""
+    try:
+        js = json.loads(health) if isinstance(health, str) else health
+    except ValueError:
+        return None
+    models = js.get("models") if isinstance(js, dict) else None
+    if not isinstance(models, dict):
+        return None
+    return {str(k): str(v) for k, v in models.items()}
+
+
+def _radiance_resident(host, port):
+    """Names of the models resident on the cards of the radiance 2 server at host:port,
+    in the server's order, from /health (which needs no key). [] when none is resident or
+    the server does not answer; cached for a few seconds."""
+    key = (host, str(port))
+    hit = _RADIANCE_HEALTH_CACHE.get(key)
+    if hit and time.monotonic() - hit[1] < _RADIANCE_HEALTH_TTL:
+        return hit[0]
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=1.0) as r:
+            states = _radiance_fleet_states(r.read().decode("utf-8", "replace"))
+    except Exception:
+        states = None
+    names = [n for n, s in (states or {}).items() if s == "resident"]
+    _RADIANCE_HEALTH_CACHE[key] = (names, time.monotonic())
+    return names
 
 
 def radiance_spec_from_cmd(cmd):
@@ -1915,7 +2173,7 @@ _RADIANCE_FLAG_GROUPS = (
     )),
     ("parallel", (
         ("tp", ("--tp",)), ("wire", ("--tp-wire",)), ("wire-min", ("--tp-wire-min-kb",)),
-        ("kernels", ("--kernels",)),
+        ("p2p", ("--p2p",)), ("kernels", ("--kernels",)),
     )),
     ("memory", (
         ("placement", ("--placement",)), ("expert/cache", ("--expert-vs-cache-ratio",)),
@@ -1928,7 +2186,8 @@ _RADIANCE_FLAG_GROUPS = (
         ("queue", ("--max-queued-requests",)),
     )),
     ("prefix cache", (
-        ("host", ("--prefix-cache-host-mib",)), ("disk", ("--prefix-cache-disk-mib",)),
+        ("host", ("--prefix-cache-mib", "--prefix-cache-host-mib",)), ("ttl", ("--prefix-cache-ttl",)),
+        ("disk", ("--prefix-cache-disk-mib",)),
         ("dir", ("--prefix-cache-dir",)), ("off", ("--no-prefix-cache",)),
         ("ckpt-every", ("--checkpoint-interval",)), ("ckpt-slots", ("--checkpoint-slots",)),
         ("ckpt-policy", ("--checkpoint-policy",)),
@@ -1941,6 +2200,12 @@ _RADIANCE_FLAG_GROUPS = (
         ("top-p", ("--top-p",)), ("min-p", ("--min-p",)),
         ("presence", ("--presence-penalty",)), ("repetition", ("--repetition-penalty",)),
         ("max-tokens", ("--default-max-tokens",)), ("template-kwargs", ("--chat-template-kwargs",)),
+    )),
+    # radiance 2's fleet keys: how the model shares the cards with the configuration's
+    # other entries (docs/MULTIMODEL.md 8). Only ever present for a 2.0 server.
+    ("fleet", (
+        ("priority", ("--priority",)), ("pin", ("--pin",)), ("idle-ttl", ("--ttl",)),
+        ("park", ("--park",)), ("flex", ("--flex",)), ("aliases", ("--aliases",)),
     )),
     ("server", (
         ("host", ("--host",)), ("port", ("--port",)), ("api-key", ("--api-key",)),
@@ -2063,7 +2328,8 @@ def llama_processes():
         if name == "vllm":
             v["model"] = vllm_from_cmd([c for c in cmd if c])["model_hint"]
         elif name == "radiance":
-            v["model"] = radiance_from_cmd([c for c in cmd if c])["model_hint"]
+            # the pid, so a 2.0 server's configuration is read through its own /proc root
+            v["model"] = radiance_from_cmd([c for c in cmd if c], os.path.basename(p))["model_hint"]
         elif "-m" in cmd:
             try:
                 v["model"] = os.path.basename(cmd[cmd.index("-m") + 1]).replace(".gguf", "")
@@ -2569,6 +2835,14 @@ class VllmProbe(LlamaProbe):
     # Prompt tokens served from the prefix cache. radiance exports no such vLLM counter and
     # names its own (RadianceProbe).
     _CACHED_COUNTER = "vllm:prompt_tokens_cached_total"
+    # How often /v1/models is re-read. The served model changes only on a restart here;
+    # a server that swaps models while it runs (radiance 2) asks more often.
+    _MODEL_TTL = 15.0
+
+    @staticmethod
+    def _pick_model(data):
+        """The /v1/models entry this panel describes: vLLM serves one model, the first."""
+        return data[0] if data and isinstance(data[0], dict) else {}
 
     def __init__(self, port="8000", host="127.0.0.1"):
         super().__init__(port, host)
@@ -2854,11 +3128,11 @@ class VllmProbe(LlamaProbe):
         d["pp_last"], d["tg_last"] = self.pp_last, self.tg_last
         d["ttft_last"], d["ttft_slots"], d["ttft_n"] = self.ttft_last, self._ttft_slots, self.ttft_n
         # ---- model and context, which change only on restart
-        if not self.model or time.monotonic() - self.model_at > 15:
+        if not self.model or time.monotonic() - self.model_at > self._MODEL_TTL:
             self.model_at = time.monotonic()
             try:
                 js = json.loads(self._get("/v1/models"))
-                first = (js.get("data") or [{}])[0]
+                first = self._pick_model(js.get("data") or [{}])
                 self.model = first.get("id") or self.model
                 if isinstance(first.get("max_model_len"), int):
                     self.ctx = first["max_model_len"]
@@ -2909,9 +3183,16 @@ class RadianceProbe(VllmProbe):
     # turned away at the HTTP queue (--queue-cap full) before reaching the engine
     _REJECT_COUNTERS = ("radiance:http_admission_rejected_total",)
     _STATS_TTL = 2.0
+    # radiance 2 swaps models on the cards by itself (a request names one and it is brought
+    # on, another parked), so which one this panel describes is re-read every few seconds
+    # instead of every fifteen: a swap otherwise showed the old name over the new model's
+    # numbers for up to a quarter of a minute.
+    _MODEL_TTL = 2.0
 
     def __init__(self, port="8000", host="127.0.0.1"):
         super().__init__(port, host)
+        self.entry = None                  # radiance 2: the fleet entry described, by name
+        self.fleet = None                  # radiance 2: {entry: state}; None on 1.x
         self.stats = {}
         self._stats_at = None
         self._step = None                  # (step seconds, steps) at the last tick
@@ -2923,13 +3204,37 @@ class RadianceProbe(VllmProbe):
         d = super()._blank()
         d.update(step_ms=self.step_ms, engine_version=None, uptime_s=None, experts=None,
                  link=self.link, kv_held=None, linear_reuse=None, prefix_evictions=None,
-                 rows_unspec=None)
+                 rows_unspec=None, fleet=self.fleet)
         return d
 
+    def _pick_model(self, data):
+        """The entry this panel describes. A 1.x server lists one model and that is it. A
+        2.0 server lists every entry of its configuration with a `state` (resident,
+        loading, closing, parked, cold, failed; docs/MULTIMODEL.md 5.4) and only the
+        resident ones are running: the engine series in /metrics exist for those alone. So
+        the panel follows the resident entry, then one being loaded (the next to serve),
+        and only with nothing on the cards falls back to the first, which is the honest
+        "nothing running" panel for an idle fleet rather than a parked model's last name.
+        Two small models can be resident at once; the name then joins them, while the
+        per-model reads (/stats, the configuration) follow the first."""
+        rows = [r for r in data if isinstance(r, dict)]
+        if not rows or not any("state" in r for r in rows):
+            self.fleet, self.entry = None, None
+            return rows[0] if rows else {}
+        self.fleet = {str(r.get("id")): str(r.get("state")) for r in rows}
+        resident = [r for r in rows if r.get("state") == "resident"]
+        pick = resident or [r for r in rows if r.get("state") == "loading"] or rows[:1]
+        self.entry = pick[0].get("id")
+        if len(resident) > 1:
+            return dict(pick[0], id=" + ".join(str(r.get("id")) for r in resident))
+        return pick[0]
+
     def _cmdline(self):
-        if self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL:
-            self._cmd = _radiance_cmd_for_port(self.port) or []
+        if (self._cmd is None or time.monotonic() - self._cmd_at > self._CMD_TTL
+                or getattr(self, "_cmd_entry", None) != self.entry):
+            self._cmd = _radiance_cmd_for_port(self.port, self.entry) or []
             self._cmd_at = time.monotonic()
+            self._cmd_entry = self.entry
         return self._cmd
 
     @staticmethod
@@ -2947,8 +3252,14 @@ class RadianceProbe(VllmProbe):
         if self._stats_at is not None and now - self._stats_at < self._STATS_TTL:
             return self.stats
         self._stats_at = now
+        # a 2.0 server serving several models refuses a bare /stats ("name one with
+        # `model`") and answers per entry; 1.x has one model and takes no parameter
+        path = "/stats"
+        if self.fleet and self.entry:
+            import urllib.parse
+            path += "?model=" + urllib.parse.quote(str(self.entry), safe="")
         try:
-            js = json.loads(self._get("/stats"))
+            js = json.loads(self._get(path))
             if isinstance(js, dict) and "error" not in js:
                 self.stats = js
         except Exception:
@@ -3047,6 +3358,7 @@ class RadianceProbe(VllmProbe):
         d["spec_type"], d["spec_head"], d["spec_nmax"] = radiance_spec_from_cmd(cmd)
         re_ = flags.get("--reasoning-effort")
         d["reasoning_format"] = f"effort {re_}" if isinstance(re_, str) else None
+        d["fleet"] = self.fleet
         self.state = d
         return d
 
