@@ -127,16 +127,19 @@ its cell shows a dash and hovering it says why.
 Servers are found by scanning `/proc` for their processes. The port comes from each server's
 command line, each server gets its own panel, and a panel's speed history resets when its
 model changes. Each server's API key is read from its own command line, so authenticated
-servers need no setup.
+servers need no setup. A radiance 2 server is started with a YAML file instead of flags
+(`radiance --config ...`); its port, models and settings are read from that file through the
+process's own `/proc/<pid>/root`, and its key from the environment variable the file names
+(`server.api-key-env`).
 
 | | llama.cpp | vLLM | radiance |
 |---|---|---|---|
-| Found by | `llama-server` process. Routers (`--models-dir`/`--models-preset`) are skipped and their per-model children probed. | `vllm` or a python process running `vllm serve` | `radiance` process (its `docker-init` wrapper is skipped) |
-| Reads | `/metrics`, `/slots`, `/props` | `/metrics` (no auth), `/v1/models` | `/metrics`, `/stats`, `/v1/models` (all need the key) |
+| Found by | `llama-server` process. Routers (`--models-dir`/`--models-preset`) are skipped and their per-model children probed. | `vllm` or a python process running `vllm serve` | `radiance` process with `--model` (1.x) or `--config` (2.0); its `docker-init` wrapper is skipped |
+| Reads | `/metrics`, `/slots`, `/props` | `/metrics` (no auth), `/v1/models` | `/metrics`, `/stats`, `/v1/models` (all need the key); on 2.0 also `/health` for the resident model, and `/stats?model=` |
 | Live decode | Slope of the busy slots' progress in `/slots`, because `/metrics` moves only when a request ends | Slope of `vllm:generation_tokens_total` | Slope of `radiance:decode_tokens_total`, because the vLLM-compatible counter moves only when a request ends |
 | Prefill | Live, then `last` | The last completed request, from histograms. The prompt counter jumps once per request, so no live rate exists. | Live from the engine's gauge during prefill, then `last`. The gauge isn't read while idle, because it decays. |
 | KV cache | Summed over every slot | Fraction of the shared pool, in tokens | Pool and use from `/stats` |
-| Context line | `ctx N/slot · total (k slots)` | `ctx N/request · pool P tok · S seqs max` | Same as vLLM, with ctx from `--max-model-len` |
+| Context line | `ctx N/slot · total (k slots)` | `ctx N/request · pool P tok · S seqs max` | Same as vLLM, with ctx from `--max-model-len` (2.0: the entry's `max-model-len`). A 2.0 panel follows whichever model is resident and resets when it swaps. |
 | Speculative | Draft head, acceptance, tokens/step, per position | Method and head from `--speculative-config`, per-position acceptance | Adds expected tokens per drafting step, computed from per-position acceptance |
 | Extras | TTFT from server counters, slot occupancy | Runs, prefix-cache reuse, ingest, preemptions, reasoning parser, TTFT/TPOT/e2e | Decode step time, experts held in VRAM with promotions/demotions, engine PCIe traffic, KV held for the next turn, linear-state reuse, version, uptime |
 
